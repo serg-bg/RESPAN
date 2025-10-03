@@ -17,7 +17,7 @@ run("Close All");
 //#@ boolean(label="Export Tif images :", description=".") TIFon
 
 start = getTime();
-//setBatchMode(true);
+setBatchMode(true);
 
 print("\\Clear");
 print(rawpath)
