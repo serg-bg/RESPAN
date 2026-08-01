@@ -74,15 +74,12 @@ def validate_analysis(labels1, labels2, settings, locations, logger):
         spines_orig = spines * 65535
         
         soma = (gt==3)
-        if np.max(soma) == 5:
-            soma_distance = soma
-        else:
-            soma_distance = ndimage.distance_transform_edt(np.invert(soma))
-        
-        
+        soma_distance = ndimage.distance_transform_edt(np.invert(soma))
+
+
         #fitler out small dendites
         dendrite_labels, num_detected = ndimage.label(dendrites)
-                
+
         # Calculate volumes and filter
         dend_vols = ndimage.sum_labels(dendrites, dendrite_labels, index=range(1, num_detected + 1))
 
@@ -92,49 +89,46 @@ def validate_analysis(labels1, labels2, settings, locations, logger):
         dendrites = np.isin(dendrite_labels, np.nonzero(large_dendrites)[0] + 1).astype(bool)
 
         filt_dendrites = np.max(measure.label(dendrites))
-        
+
         logger.info(f"  {filt_dendrites} of {num_detected} detected dendrites larger than minimum volume threshold of {settings.min_dendrite_vol} voxels")
-        
-           
+
+
         logger.info(f"   Processing {filt_dendrites} dendrites...")
-        
-        dendrite_distance = ndimage.distance_transform_edt(np.invert(dendrites)) #invert neuron mask to get outside distance  
+
+        dendrite_distance = ndimage.distance_transform_edt(np.invert(dendrites)) #invert neuron mask to get outside distance
         dendrites = dendrites.astype(np.uint8)
         skeleton = morphology.skeletonize_3d(dendrites)
-        
+
         soma_distance = ndimage.distance_transform_edt(np.invert(soma))
-        
-        
-        
+
+
+
         #Detection
         logger.info("   Detecting spines...")
         spine_labels = imgan.spine_detection(spines, settings.erode_shape, settings.remove_touching_boarders, logger) #binary image, erosion value (0 for no erosion)
-        
+
         max_label = np.max(spine_labels)
-        
+
         #Measurements
         spine_table, gt_spines = imgan.spine_measurementsV2(dendrites, spine_labels, 1, max_label, settings.neuron_channel, dendrite_distance, soma_distance, settings.neuron_spine_size, settings.neuron_spine_dist, settings, locations, analysis_files[file], logger)
 
         dendrite_length = np.sum(skeleton == 1)
 
         dendrite_volume = np.sum(dendrites ==1)
-          
-       
+
+
         gt_dendrite_length = dendrite_length
-        gt_dendrites =  dendrites 
- 
-        
+        gt_dendrites =  dendrites
+
+
         #### OUTPUT SPINES --- UPDATE TO FUNCTIONS
         spines = (output == 1).astype(np.uint8)
         dendrites = (output == 2).astype(np.uint8)
         #soma = (image == 3).astype(np.uint8)
         spines_orig = spines * 65535
-        
-        soma = (gt==3)
-        if np.max(soma) == 5:
-            soma_distance = soma
-        else:
-            soma_distance = ndimage.distance_transform_edt(np.invert(soma))
+
+        soma = (output==3)
+        soma_distance = ndimage.distance_transform_edt(np.invert(soma))
         
         #dendrite_labels = measure.label(dendrites)
         #fitler out small dendites
@@ -276,14 +270,14 @@ def spine_comparison(gt, output, sizes, spine_table, logger):
     
     filtered_table = gt_table[(gt_table['area'] > volume_min) & (gt_table['area'] < volume_max) ]
     
-    gt_spines_filtered = gt_table.shape[0]
+    gt_spines_filtered = filtered_table.shape[0]
     spine_table.insert(4, 'gt_total_spines_filtered', gt_spines_filtered)
-    
+
     output_spines = output_table.shape[0]
     spine_table.insert(5, 'output_total_spines', output_spines)
-    
-    filtered_table = output_table[(output_table['area'] > volume_min) & (output_table['area'] < volume_max) ]  
-    output_spines_filtered = output_table.shape[0]
+
+    filtered_table = output_table[(output_table['area'] > volume_min) & (output_table['area'] < volume_max) ]
+    output_spines_filtered = filtered_table.shape[0]
     spine_table.insert(6, 'output_total_spines_filtered', output_spines_filtered)
     
     
@@ -313,15 +307,17 @@ def spine_comparison(gt, output, sizes, spine_table, logger):
     #gt spines detected
     
     #spine precision (TP / TP + FP)
-    spine_precision_iou50 = TP_iou50 / (TP_iou50 + FP_iou50)
+    precision_denom = TP_iou50 + FP_iou50
+    spine_precision_iou50 = TP_iou50 / precision_denom if precision_denom > 0 else 0.0
     #spine_precision_iou75 = TP_iou75 / (TP_iou75 + FP_iou50)
     spine_table.insert(10, 'spine_precision_IoU50', spine_precision_iou50)
     #spine_table.insert(13, 'spine_precision_IoU75', spine_precision_iou75)
     #spine_pre_iou050 - 50%
-    #spine_pre_iou075 - strict        
-    
+    #spine_pre_iou075 - strict
+
     #spine recall (TP / TP + FN)
-    spine_recall_iou50 = TP_iou50 / (TP_iou50 + (gt_spines_filtered - TP_iou50))
+    recall_denom = TP_iou50 + (gt_spines_filtered - TP_iou50)
+    spine_recall_iou50 = TP_iou50 / recall_denom if recall_denom > 0 else 0.0
     #spine_recall_iou75 = TP_iou75 / (TP_iou75 + (gt_spines_filtered - TP_iou75))
     spine_table.insert(11, 'spine_recall_IoU50', spine_recall_iou50)
     #spine_table.insert(15, 'spine_recall_IoU75', spine_recall_iou75) 
@@ -333,7 +329,8 @@ def spine_comparison(gt, output, sizes, spine_table, logger):
 def IoU_calc(target, prediction):
     intersection = np.logical_and(target, prediction)
     union = np.logical_or(target, prediction)
-    iou_score = np.sum(intersection) / np.sum(union)
+    union_sum = np.sum(union)
+    iou_score = np.sum(intersection) / union_sum if union_sum > 0 else 0.0
     return iou_score
     
 

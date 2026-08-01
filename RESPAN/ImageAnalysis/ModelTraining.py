@@ -340,6 +340,61 @@ def train_care(inputdir, model_output, model_name, augmentation, image_type, pat
     # Prepare data
     # logger.info(f"{inputdir}\n{source_dir}\n{target_dir}")
 
+    # Pre-flight check: csbdeep's RawData.from_folder raises a generic
+    # "Didn't find any images." with no diagnostic info. Validate both
+    # directories exist and contain matched .tif/.tiff files before the
+    # call, then surface a specific error pointing to the actual problem.
+    # Issue #10 (https://github.com/lahammond/RESPAN/issues/10).
+    _src_path = os.path.join(inputdir, source_dir)
+    _tgt_path = os.path.join(inputdir, target_dir)
+    _tif_exts = ('.tif', '.tiff')
+    if not os.path.isdir(_src_path):
+        raise FileNotFoundError(
+            f"CARE source directory not found: {_src_path}\n"
+            f"  Expected subfolder '{source_dir}' inside {inputdir}\n"
+            f"  Folder names are case-sensitive."
+        )
+    if not os.path.isdir(_tgt_path):
+        raise FileNotFoundError(
+            f"CARE target directory not found: {_tgt_path}\n"
+            f"  Expected subfolder '{target_dir}' inside {inputdir}\n"
+            f"  Folder names are case-sensitive."
+        )
+    _src_tifs = sorted(f for f in os.listdir(_src_path)
+                       if f.lower().endswith(_tif_exts))
+    _tgt_tifs = sorted(f for f in os.listdir(_tgt_path)
+                       if f.lower().endswith(_tif_exts))
+    if not _src_tifs:
+        raise FileNotFoundError(
+            f"CARE source directory contains no .tif/.tiff files: {_src_path}\n"
+            f"  Found {len(os.listdir(_src_path))} item(s) but none matching {_tif_exts}.\n"
+            f"  Convert non-TIFF inputs (e.g. .nd2, .czi, .lif) using the supplied Fiji macro."
+        )
+    if not _tgt_tifs:
+        raise FileNotFoundError(
+            f"CARE target directory contains no .tif/.tiff files: {_tgt_path}\n"
+            f"  Found {len(os.listdir(_tgt_path))} item(s) but none matching {_tif_exts}."
+        )
+    if len(_src_tifs) != len(_tgt_tifs):
+        raise ValueError(
+            f"CARE source/target file counts differ: "
+            f"{len(_src_tifs)} in {source_dir} vs {len(_tgt_tifs)} in {target_dir}.\n"
+            f"  Each low-SNR image needs a matching high-SNR image with the same filename."
+        )
+    if _src_tifs != _tgt_tifs:
+        _missing_in_tgt = set(_src_tifs) - set(_tgt_tifs)
+        _missing_in_src = set(_tgt_tifs) - set(_src_tifs)
+        raise ValueError(
+            f"CARE source/target filenames do not match.\n"
+            f"  Files in {source_dir} but not in {target_dir}: {sorted(_missing_in_tgt)[:5]}\n"
+            f"  Files in {target_dir} but not in {source_dir}: {sorted(_missing_in_src)[:5]}\n"
+            f"  Each low-SNR image needs a matching high-SNR image with the same filename."
+        )
+    logger.info(
+        f"CARE training pairs validated: {len(_src_tifs)} files in "
+        f"'{source_dir}' / '{target_dir}'"
+    )
+
     raw_data = RawData.from_folder(
         basepath=inputdir,
         source_dirs=[source_dir],
@@ -531,7 +586,151 @@ def generate_nnunet_json(input_folder, use_ignore=False):
     return json_data
 
 
+def _preflight_nnunet_training_setup(raw, datasetID, logger):
+    """Pre-flight checks for nnU-Net training. Raises with actionable messages
+    when a known failure mode is detected, so the user gets a clear error
+    instead of the generic 'Plan and preprocess failed with return code 1'.
+
+    Common nnU-Net plan_and_preprocess crash modes (Issue: GUI training fails on 3 devices):
+      1. numTraining < 5: default 5-fold CV split crashes during fingerprint extraction.
+      2. OneDrive Files-On-Demand: zero-byte placeholders that nnU-Net opens then fails on.
+      3. Path with spaces / OneDrive: works for some tools, breaks others through .bat chains.
+      4. Missing/malformed dataset.json or imagesTr/labelsTr layout.
+    """
+    # Locate the Dataset folder under raw
+    dataset_dirs = []
+    if os.path.isdir(raw):
+        for entry in os.listdir(raw):
+            full = os.path.join(raw, entry)
+            if (os.path.isdir(full) and entry.lower().startswith('dataset')
+                    and (entry.endswith(f'{int(datasetID):03d}')
+                         or entry[7:10] == f'{int(datasetID):03d}')):
+                dataset_dirs.append(full)
+    if not dataset_dirs:
+        raise FileNotFoundError(
+            f"No Dataset{int(datasetID):03d}* folder found inside nnUNet_raw:\n"
+            f"  {raw}\n"
+            f"  Expected layout: nnUNet_raw/Dataset{int(datasetID):03d}_NAME/imagesTr/...\n"
+            f"  See the RESPAN nnU-Net training tutorial for folder structure."
+        )
+    dataset_dir = dataset_dirs[0]
+
+    # Soft warnings for path issues
+    if ' ' in raw:
+        logger.warning(
+            f"  Training data path contains spaces:\n"
+            f"    {raw}\n"
+            f"  Spaces in paths can cause issues with nnU-Net's batch-file invocation chain.\n"
+            f"  If training fails, try copying the data to a path without spaces "
+            f"(e.g. C:\\nnUNet_data\\)."
+        )
+    if 'OneDrive' in raw or 'Dropbox' in raw or 'Google Drive' in raw:
+        cloud = next(c for c in ('OneDrive', 'Dropbox', 'Google Drive') if c in raw)
+        logger.warning(
+            f"  Training data is in a {cloud}-synced folder:\n"
+            f"    {raw}\n"
+            f"  Cloud sync can virtualize files (placeholders) and lock them during sync, "
+            f"which causes nnU-Net to fail mid-fingerprint with no clear error.\n"
+            f"  Recommendation: copy the dataset to a local non-synced folder before training."
+        )
+
+    # Check imagesTr/labelsTr exist and contain .tif files
+    images_dir = os.path.join(dataset_dir, 'imagesTr')
+    labels_dir = os.path.join(dataset_dir, 'labelsTr')
+    if not os.path.isdir(images_dir):
+        raise FileNotFoundError(
+            f"imagesTr folder not found: {images_dir}\n"
+            f"  nnU-Net v2 requires images in '{dataset_dir}/imagesTr/'."
+        )
+    if not os.path.isdir(labels_dir):
+        raise FileNotFoundError(
+            f"labelsTr folder not found: {labels_dir}\n"
+            f"  nnU-Net v2 requires labels in '{dataset_dir}/labelsTr/'."
+        )
+
+    image_files = [f for f in os.listdir(images_dir) if f.lower().endswith(('.tif', '.tiff'))]
+    label_files = [f for f in os.listdir(labels_dir) if f.lower().endswith(('.tif', '.tiff'))]
+    if not image_files:
+        raise FileNotFoundError(
+            f"No .tif/.tiff files found in {images_dir}\n"
+            f"  Found {len(os.listdir(images_dir))} item(s), none with .tif/.tiff extension."
+        )
+    if not label_files:
+        raise FileNotFoundError(
+            f"No .tif/.tiff files found in {labels_dir}"
+        )
+
+    # Check for zero-byte files (OneDrive placeholders are the usual culprit)
+    zero_byte = []
+    for d, files in [(images_dir, image_files), (labels_dir, label_files)]:
+        for f in files:
+            try:
+                if os.path.getsize(os.path.join(d, f)) == 0:
+                    zero_byte.append(os.path.join(d, f))
+            except OSError:
+                zero_byte.append(os.path.join(d, f))
+    if zero_byte:
+        msg = (
+            f"Found {len(zero_byte)} zero-byte file(s) in training data. "
+            f"This usually means cloud-sync placeholders (OneDrive Files-On-Demand, "
+            f"Dropbox Smart Sync) that haven't been downloaded yet.\n"
+            f"  First few: {zero_byte[:3]}\n"
+            f"  Fix: right-click the parent folder and 'Always keep on this device', "
+            f"or copy to a local non-synced folder."
+        )
+        raise IOError(msg)
+
+    # Count training cases (label files = case count). RESPAN trains nnU-Net with
+    # fold='all' (no cross-validation, see train_nnUNet's cmd_train), so the default
+    # 5-fold-CV minimum of 5 cases does not apply here. plan_and_preprocess itself
+    # works with any case count >= 1. Just informational logging.
+    n_cases = len(label_files)
+    if n_cases < 3:
+        logger.info(
+            f"  Note: {n_cases} training case(s) found. RESPAN trains with fold='all', "
+            f"so cross-validation is not required, but very small training sets may "
+            f"produce models that overfit and do not generalize."
+        )
+
+    # Verify channel-count / file-naming sanity (nnU-Net v2 expects CASE_NNNN.tif)
+    bad_names = []
+    for f in image_files:
+        stem = f[:-4] if f.lower().endswith('.tif') else f[:-5]
+        if not (len(stem) > 5 and stem[-5] == '_' and stem[-4:].isdigit()):
+            bad_names.append(f)
+    if bad_names:
+        logger.warning(
+            f"  {len(bad_names)} image file(s) do not follow the nnU-Net v2 naming "
+            f"convention 'CASE_NNNN.tif' (4-digit channel suffix). Examples: {bad_names[:3]}\n"
+            f"  This may cause plan_and_preprocess to fail with channel-mismatch errors."
+        )
+
+    # Verify dataset.json exists
+    dataset_json = os.path.join(dataset_dir, 'dataset.json')
+    if not os.path.isfile(dataset_json):
+        raise FileNotFoundError(
+            f"dataset.json not found in {dataset_dir}\n"
+            f"  This file should have been generated automatically. If you launched "
+            f"training without it, regenerate via the GUI's training tab."
+        )
+
+    logger.info(
+        f"  nnU-Net training pre-flight passed: {n_cases} cases, "
+        f"{len(image_files)} image file(s), dataset folder '{os.path.basename(dataset_dir)}'."
+    )
+
+
 def train_nnUNet(raw, preprocessed, results, datasetID, python_path, clean_launcher, plan_bat, train_bat, logger):
+    # Pre-flight: validate folder structure, file counts, and known-bad path patterns.
+    # Raises a specific error before invoking nnU-Net so the user sees the actual cause
+    # instead of a generic "return code 1" with a truncated traceback.
+    # Addresses the long-standing GUI nnU-Net training failure reported on 3 devices.
+    try:
+        _preflight_nnunet_training_setup(raw, datasetID, logger)
+    except (FileNotFoundError, ValueError, IOError) as e:
+        logger.error(f"nnU-Net training setup invalid:\n{e}")
+        raise
+
     # Set environment variables
     os.environ['nnUNet_raw'] = raw
     os.environ['nnUNet_preprocessed'] = preprocessed
@@ -585,6 +784,15 @@ def train_nnUNet(raw, preprocessed, results, datasetID, python_path, clean_launc
 
     if return_code_plan != 0:
         logger.error(f"Plan and preprocess failed with return code {return_code_plan}")
+        logger.error(
+            "Common causes (check the stderr/traceback above):\n"
+            "  1. Cloud-sync paths (OneDrive, Dropbox, Google Drive): copy data to a local folder.\n"
+            "  2. Paths with spaces: copy data to a path without spaces (e.g. C:\\nnUNet_data\\).\n"
+            "  3. Image/label shape mismatch: every imagesTr file must match its labelsTr counterpart in shape.\n"
+            "  4. dataset.json mismatch: re-check that file_ending, channel_names, and labels match the actual files.\n"
+            "  5. File-naming: nnU-Net v2 expects 'CASE_0000.tif' for single channel, 'CASE_0000.tif' + 'CASE_0001.tif' etc. for multi-channel. Labels are 'CASE.tif' (no channel suffix).\n"
+            "  6. Zero-byte files: OneDrive Files-On-Demand placeholders. Right-click folder -> 'Always keep on this device'."
+        )
         return return_code_plan
 
     logger.info('Plan and preprocess complete.')

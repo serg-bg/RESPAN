@@ -1,56 +1,151 @@
-Parameters: #Note: Overwritten by GUI by default - can be used for batch processing datasets with different parameters
-    input_resXY: 0.102 #raw data resolution
-    input_resZ: 1 #raw data resolution
-    model_resXY: 0.102 #resolution of trained model
-    model_resZ: 1 #resolution of trained model
+# RESPAN Analysis_Settings.yaml — canonical example
+# ==================================================
+# This template shows every YAML-settable option. When the GUI runs, most
+# values below are overridden at run time by the widgets (see the GUI
+# "Spine Thresholding" and "Additional Options" groups). YAML is still the
+# source of truth for headless / batch runs and for expert-only knobs that
+# are not exposed in the GUI.
+#
+# All sections below MUST exist (even if empty) — Create_Settings reads them
+# positionally. Leave values at their shown defaults unless you have a reason
+# to change them. Lines beginning with `#` are comments.
 
+# ---------------------------------------------------------------
+# PARAMETERS — voxel resolutions (required)
+# ---------------------------------------------------------------
+Parameters: # Note: Overwritten by GUI by default - can be used for batch processing datasets with different parameters
+    input_resXY: 0.102          # raw image XY voxel size, µm  (REQUIRED — verify per dataset)
+    input_resZ: 1               # raw image Z voxel size, µm   (REQUIRED)
+    model_resXY: 0.102          # resolution the nnU-Net model was trained on, µm
+    model_resZ: 1               # resolution the nnU-Net model was trained on, µm
+
+# ---------------------------------------------------------------
+# ANALYSIS — pipeline tuning (mostly fixed, power-user knobs)
+# ---------------------------------------------------------------
 Analysis:
-    tiles_for_prediction: (2,3,3) #Setting used to break image into tiles for inference on GPU
-    roi_volume_size: 4 #in microns in x, y, z - approx 50px for 0.3 resolution data
-    GPU_block_size: (150,500,500) #dims used for processing images in block for cell extraction. Reduce if recieving out of memory errors
-   
-    validation_format: tif #    jpg mips for quick val
-    validation_scale: (1,1) #output scaling for validation data e.g. (2,2) for half scale
-    validation_jpeg_comp: 100    #100% quality default
+    tiles_for_prediction: (2,3,3)  # nnU-Net inference tiling (Z, Y, X). 2x3x3 = 18 tiles.
+    roi_volume_size: 4             # ROI crop size in µm (X, Y, Z) for mesh analysis
+    GPU_block_size: (150,500,500)  # Block dims (Z, Y, X voxels) for chunked processing. Reduce if GPU OOMs.
 
-    erode_shape: (0.5,2,2)
-    remove_touching_boarders: False
-    
-    additional_logging: False
+    erode_shape: (0.5,2,2)         # Structuring element for spine surface cleanup
+    remove_touching_boarders: False # Drop spines touching the image edge
 
+    validation_format: tif         # MIP output format: tif | jpg
+    validation_scale: (1,1)        # Output scale factor for MIPs. (2,2) halves XY.
+    validation_jpeg_comp: 100      # JPEG quality 1-100 (only if validation_format=jpg)
+
+    additional_logging: False      # Verbose per-stage logging (console)
+
+# ---------------------------------------------------------------
+# EXTERNAL TOOL PATHS
+# ---------------------------------------------------------------
 Vaa3D:
     path: C:/Program Files/Vaa3D_1_1_4 windows/Vaa3D-x.exe
 
-# CARE SETTINGS
-
+# ---------------------------------------------------------------
+# CARE IMAGE RESTORATION (per-channel, optional)
+# ---------------------------------------------------------------
+# - restore:        True to run CARE on this channel; False to skip.
+# - rest_model_path: path to a trained CARE model dir. Unused if restore=False.
+# - rest_type:      ("care", N) where N is an intensity threshold (0-255)
+#                    used to zero low-intensity artifacts after restoration.
 Channel1:
-    restore: True # Restore image data first using image restoration model
-    rest_model_path: D:/Dropbox/Github/spine-analysis/spinepipe\Models/Restoration/100xSil_xy65nm_z150nm_BFP_dendrite_decon_v1/   #Path to restoration model. Else None
-    rest_type: ("care", 100)    #Type and backbone type if using tf models. If "care", follow by a threshold to remove low intensities and potential artifacts.
+    restore: True
+    rest_model_path: D:/Models/Restoration/CARE_channel1/
+    rest_type: ("care", 100)
 Channel2:
-    restore: False # Restore image data first using image restoration model
-    rest_model_path: None   #Path to restoration model"
-    rest_type: ("care", 100)    #Type and backbone type if using tf models. If "care", follow by a threshold to remove low intensities and potential artifacts.
+    restore: False
+    rest_model_path: None
+    rest_type: ("care", 100)
 Channel3:
-    restore: False # Restore image data first using image restoration model
-    rest_model_path: None   #Path to restoration model"
-    rest_type: ("care", 100)    #Type and backbone type if using tf models. If "care", follow by a threshold to remove low intensities and potential artifacts.
+    restore: False
+    rest_model_path: None
+    rest_type: ("care", 100)
 Channel4:
-    restore: False # Restore image data first using image restoration model
-    rest_model_path: None   #Path to restoration model"
-    rest_type: ("care", 100)    #Type and backbone type if using tf models. If "care", follow by a threshold to remove low intensities and potential artifacts.
+    restore: False
+    rest_model_path: None
+    rest_type: ("care", 100)
 
-# SELFNET SETTINGS
-
+# ---------------------------------------------------------------
+# SELFNET axial-resolution restoration (optional)
+# ---------------------------------------------------------------
 SelfNet:
-    model_path: D:\Project_Data\RESPAN\_Axial_restoration\SelfnetV3\raw_data\checkpoint\saved_models\deblur_net_60_1600.pkl
+    model_path: D:/Models/SelfNet/deblur_net.pkl
 
-
-# SPINE REFINEMENT SETTINGS
-
+# ---------------------------------------------------------------
+# SPINE REFINEMENT (optional second-pass nnU-Net on isolated spines)
+# ---------------------------------------------------------------
 Refinement:
-    model_path: D:\nnUnet\results\Dataset888_RESPAN_2nd_pass_spine_arrays
-    model_resXY: 0.065 #resolution of trained 2ndpass model
-    model_resZ: 0.065 #resolution of trained 2ndpass model
+    model_path: D:/Models/Refinement/Dataset888_spinerefine/
+    model_resXY: 0.065             # resolution of the refinement model (µm)
+    model_resZ: 0.065              # resolution of the refinement model (µm)
 
+# ---------------------------------------------------------------
+# SPURIOUSNECK — neck-quality filters + partial-spine handling
+# ---------------------------------------------------------------
+# The GUI writes over most of these keys. Defaults below reflect the
+# current production choices (2026-04-20).
+SpuriousNeck:
+    # ---------- Spurious-neck AND-gate --------------------------------
+    # A neck is FLAGGED if ALL hold:
+    #   1. path length > path_length_min_um                    (µm)
+    #   2. nnU-Net support < nnunet_support_min                (fraction 0-1)
+    #   3. (ONLY if require_intensity=True) intensity_ratio < intensity_ratio_min
+    path_length_min_um: 1.0        # Default 1.0 µm; real spine necks are 0.2-1.5 µm
+    nnunet_support_min: 0.2        # Fraction of neck voxels that must be nnU-Net-backed
+    intensity_ratio_min: 0.4       # Mean-neck / mean-head intensity (YAML-only; inert unless require_intensity=True)
+    require_intensity: False       # When True, the intensity criterion is ANDed into the gate (YAML-only)
 
+    # ---------- Action when a neck is flagged -------------------------
+    # exclude_mode:
+    #   neck_only  — drop neck voxels only; head is retained and reclassified
+    #                as partial-spine (default). Symmetric with orphan-head
+    #                handling: real spines are not punished for a bad neck.
+    #   both       — drop BOTH neck and spine voxels (aggressive; use only
+    #                if flagged spines are always false positives).
+    #   flag_only  — only record to neck_path_confidence.csv (no drops).
+    exclude_mode: neck_only
+    # When True AND exclude_mode=both, downgrade to neck_only per flagged
+    # spine. Effectively a no-op when default exclude_mode=neck_only.
+    keep_head_if_flagged: False
+
+    # ---------- Post-bridge cleanup filters ---------------------------
+    # For each spine whose (spine ∪ neck) has multiple 26-connected components
+    # after all bridges, keep only the CC that contains the spine head.
+    drop_disconnected_neck_fragments: True
+    # For each spine with ≥2 head-adjacent neck CCs, keep only the CC whose
+    # min distance-to-dendrite is smallest (biological necks approach dendrite).
+    drop_wrong_direction_neck_fragments: True
+    # Tolerance (µm) for the wrong-direction filter — CCs within this distance
+    # of the winner's minimum are ALL kept (permits mildly branched necks).
+    neck_direction_tolerance_um: 0.2
+
+    # Truncate necks whose voxels touch another spine's head (26-conn).
+    # Default OFF — partial-spine classification is the preferred handling.
+    trim_necks_touching_other_spines: False
+
+    # ---------- Partial-spine handling --------------------------------
+    # A spine is classified partial when the neck exists but does NOT reach
+    # the dendrite (typically an adjacent head occludes the path).
+    keep_partial_spines: True      # True: keep row, zero neck metrics, set spine_type='partial-spine'
+                                    # False: drop the row entirely
+    # Neck considered NOT to reach dendrite when min(dendrite_distance) over
+    # neck voxels exceeds this value (voxels). Default 2 ≈ 0.13 µm at 65 nm XY.
+    partial_spine_dist_threshold_vox: 2.0
+
+# ---------------------------------------------------------------
+# TOP-LEVEL TOGGLES (also checked inside SpuriousNeck for legacy compat;
+# top-level wins when both are set)
+# ---------------------------------------------------------------
+# Preserve nnU-Net neck CCs with no associated spine head by carving a head
+# from the tip of the orphan neck. Marks spine_type='filopodia'.
+recover_filopodia: False
+
+# Tiny spine-head backstop — drop any spine-head label with voxel count
+# <= this value BEFORE neck association. Default 2 catches 1-2-voxel stubs
+# that split real necks in Pass 1. Set to 0 (or negative) to disable.
+min_spine_head_voxels: 2
+
+# Duplicate of the SpuriousNeck.neck_direction_tolerance_um key. Both are
+# checked; top-level wins if both are set.
+# neck_direction_tolerance_um: 0.2

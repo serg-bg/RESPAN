@@ -59,21 +59,26 @@ def suppress_all_output():
 
 
 def restore_and_segment(settings, locations, logger):
-    if settings.image_restore == True:
+    # Note (Phase L0.5 scope): the streaming TIFF→zarr ingest landed below in
+    # nnunet_create_labels covers the dominant path (settings.axial_restore=False,
+    # settings.image_restore=False). The branches that call axial_restore_image()
+    # / restore_image() still go through their own imread() at large scale and
+    # remain a future-scope BLOCKER for any 55 GB+ run that has either flag
+    # enabled. T_LARGE today has both flags False so this is not on the
+    # critical path. Tracked for follow-up.
+    if settings.image_restore and settings.axial_restore:
         restore_image(locations.input_dir, settings, locations, logger)
         data = locations.restored
-
-    if settings.image_restore == False and settings.axial_restore == True:
-        # restore axial resolution from raw data
-        axial_restore_image(locations.input_dir, settings, locations, logger)
-        data = locations.restored + '/selfnet/'
-
-
-    elif settings.image_restore == True and settings.axial_restore == True:
         # restore axial resolution on CARE restored data
         axial_restore_image(data, settings, locations, logger)
         data = locations.restored + '/selfnet/'
-
+    elif settings.image_restore:
+        restore_image(locations.input_dir, settings, locations, logger)
+        data = locations.restored
+    elif settings.axial_restore:
+        # restore axial resolution from raw data
+        axial_restore_image(locations.input_dir, settings, locations, logger)
+        data = locations.restored + '/selfnet/'
     else:
         data = locations.input_dir
 
@@ -97,7 +102,7 @@ def run_external_script(script_path, py_path, args):
     for k, v in args.items():
         cmd += [f"--{k}", str(v)]
 
-    print("Executing: %s", " ".join(cmd))
+    print(f"Executing: {' '.join(cmd)}")
 
     with subprocess.Popen(cmd, stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT, text=True) as proc:
@@ -125,6 +130,7 @@ def clean_percentage_line(line):
 
 
 def log_output(pipe, logger, buffer):
+    print50 = 0
     while True:
         try:
             line = pipe.readline()
@@ -141,7 +147,6 @@ def log_output(pipe, logger, buffer):
 
             # Append all output to the buffer
             buffer.append(decoded_line + '\n')
-            print50 = 0
             # Clean and filter the output
             if "%" in decoded_line:
                 cleaned_line = clean_percentage_line(decoded_line)
@@ -300,7 +305,7 @@ def restore_image(inputdir, settings, locations, logger):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             if settings.validation_format == "tif":
-                imwrite(locations.restored + files[file], restored, compression=('zlib', 1), imagej=True,
+                imwrite(locations.restored + files[file], restored, compression='zlib', compressionargs={'level': 1}, imagej=True,
                         photometric='minisblack',
                         metadata={'spacing': settings.input_resZ, 'unit': 'um', 'axes': 'ZCYX', 'mode': 'composite'},
                         resolution=(settings.input_resXY, settings.input_resXY))
@@ -376,26 +381,174 @@ def nnunet_create_labels(inputdir, settings, locations, logger):
         reference_image = None
         settings.prev_labels = False
 
+        # Threshold for the metadata-gated streaming TIFF→zarr ingest.
+        # Below this, the legacy imread path is byte-identical and faster.
+        # Above this, imread risks contiguous-numpy MemoryError (T_LARGE 55 GB
+        # raw + 27.7 GB labels failed at 82 GB demand on a 137 GB host).
+        _STREAM_INGEST_THRESHOLD_BYTES = 5 * (1024 ** 3)  # 5 GiB
+
         for file in range(len(files)):
             logger.info(f"   Preparing image {file + 1} of {len(files)} - {files[file]}")
 
-            image = imread(inputdir + files[file])
-            logger.info(f"   Raw data has shape: {image.shape}")
+            img_path = inputdir + files[file]
 
-            image = imgan.check_image_shape(image, logger)
+            # Phase L0.5: metadata-first decision gate. Read shape/dtype/axes
+            # without loading data so we can pick streaming vs imread before
+            # any allocation. Falls back to legacy imread for unusual axes.
+            import RESPAN.ImageAnalysis.ChunkedProcessing as _chunked
+            try:
+                _img_meta = _chunked.tiff_metadata(img_path)
+            except Exception as _meta_err:
+                logger.warning(
+                    f"   tiff_metadata failed ({_meta_err}); falling back to imread")
+                _img_meta = None
 
-            if settings.axial_restore == True:
-                neuron = image[:, 0, :, :]
+            _resseg_workspace = None
+            _use_stream_ingest = False
+            _select_channel = None
+
+            if _img_meta is not None:
+                _src_axes = _img_meta['axes']
+                _src_shape = _img_meta['shape']
+                _itemsize = int(_img_meta['dtype'].itemsize)
+                if _src_axes == 'ZYX':
+                    _neuron_bytes = int(np.prod(np.array(_src_shape, dtype=np.int64))) * _itemsize
+                    _use_stream_ingest = _neuron_bytes > _STREAM_INGEST_THRESHOLD_BYTES
+                    _select_channel = None
+                elif _src_axes == 'ZCYX':
+                    _z, _c, _y, _x = _src_shape
+                    _neuron_bytes = int(_z) * int(_y) * int(_x) * _itemsize
+                    _use_stream_ingest = _neuron_bytes > _STREAM_INGEST_THRESHOLD_BYTES
+                    _select_channel = (0 if settings.axial_restore
+                                       else settings.neuron_channel - 1)
+                elif _src_axes == 'CZYX':
+                    _c, _z, _y, _x = _src_shape
+                    _neuron_bytes = int(_z) * int(_y) * int(_x) * _itemsize
+                    _use_stream_ingest = _neuron_bytes > _STREAM_INGEST_THRESHOLD_BYTES
+                    _select_channel = (0 if settings.axial_restore
+                                       else settings.neuron_channel - 1)
+                else:
+                    _use_stream_ingest = False  # unusual axes → legacy fallback
+
+            if _use_stream_ingest:
+                logger.info(
+                    f"   Raw data has shape: {_img_meta['shape']} (axes={_img_meta['axes']})")
+                logger.info(
+                    f"   Estimated neuron-channel size: {_neuron_bytes / 1e9:.2f} GB "
+                    f"— streaming TIFF→zarr (avoids contiguous numpy alloc)")
+                _name_no_ext = os.path.splitext(files[file])[0]
+                _resseg_workspace = _chunked.ZarrWorkspace(
+                    locations, f"resseg_{_name_no_ext}", logger)
+                neuron = _chunked.tiff_to_zarr_3d(
+                    img_path, _resseg_workspace, 'neuron',
+                    select_channel=_select_channel, logger=logger)
+                # neuron is a 3D zarr handle (Z, Y, X); chunked_resize_xy_pass
+                # consumes it via per-Z slicing without further materialization.
+                # No `image` numpy variable exists in this branch — there is
+                # no full 4D array to detach from, eliminating the T_LARGE
+                # 55 GB neuron.copy() transient.
             else:
-                neuron = image[:, settings.neuron_channel - 1, :, :]
+                image = imread(img_path)
+                logger.info(f"   Raw data has shape: {image.shape}")
+
+                image = imgan.check_image_shape(image, logger)
+
+                if settings.axial_restore == True:
+                    neuron = image[:, 0, :, :]
+                else:
+                    neuron = image[:, settings.neuron_channel - 1, :, :]
 
             # rescale if required by model
             if settings.input_resZ != settings.model_resZ or settings.input_resXY != settings.model_resXY:
                 settings.original_shape[file] = neuron.shape
                 # new_shape = (int(neuron.shape[0] * settings.scaling_factors[0]), neuron.shape[1] * settings.scaling_factors[1]), neuron.shape[2] * settings.scaling_factors[2]))
                 new_shape = tuple(int(dim * factor) for dim, factor in zip(neuron.shape, settings.scaling_factors))
-                neuron = resize(neuron, new_shape, mode='constant', preserve_range=True, anti_aliasing=True)
+                # Gate on size: skimage.transform.resize calls convert_to_float()
+                # which allocates a full-volume float64 buffer (8x input bytes).
+                # At T_LARGE (29.8B voxels) that's 222 GB — instant OOM. Use the
+                # chunked helper for large volumes; preserve skimage path for
+                # small ones (T2/T4 byte-identical).
+                _n_vox = int(neuron.shape[0]) * int(neuron.shape[1]) * int(neuron.shape[2])
+                if _n_vox > 1_000_000_000:
+                    import gc as _gc
+                    _neuron_dtype = neuron.dtype
+                    if hasattr(neuron, 'chunks'):
+                        # Zarr-backed neuron from streaming ingest above. No
+                        # detach needed (no parent 4D image array exists);
+                        # chunked_resize_xy_pass reads per-Z slabs zarr-safely.
+                        pass
+                    else:
+                        # Legacy numpy-view neuron (channel slice of `image`).
+                        # Detach via .copy() then free `image` so its working
+                        # set is reclaimed before chunked_resize allocates the
+                        # float32 intermediate. Only fires when imread was used,
+                        # which requires the volume to fit in RAM in the first
+                        # place — safe.
+                        neuron = neuron.copy()
+                        try:
+                            del image
+                        except NameError:
+                            pass
+                        _gc.collect()
+                    # Split-pass: free `neuron` between Pass 1 and Pass 2 so
+                    # input + intermediate + output don't all coexist. At
+                    # T_LARGE this drops the peak by the input volume bytes.
+                    _intermediate = _chunked.chunked_resize_xy_pass(
+                        neuron, new_shape, order=1, logger=logger)
+                    del neuron
+                    _gc.collect()
+                    # Streaming-ingest workspace is no longer needed once the
+                    # neuron zarr has been consumed by xy_pass — its on-disk
+                    # bytes can be reclaimed before z_pass allocates output.
+                    if _resseg_workspace is not None:
+                        try:
+                            _resseg_workspace.cleanup()
+                        except Exception as _cleanup_err:
+                            logger.warning(
+                                f"   resseg workspace cleanup failed: {_cleanup_err}")
+                        _resseg_workspace = None
+                    neuron = _chunked.chunked_resize_z_pass(
+                        _intermediate, new_shape, order=1,
+                        dtype=_neuron_dtype, logger=logger)
+                    del _intermediate
+                    _gc.collect()
+                else:
+                    # Small-volume legacy resize. If neuron is a zarr handle
+                    # (rare — would mean the streaming ingest fired below the
+                    # 1B-vox threshold but the source TIFF was streamed for
+                    # other reasons), materialize once for skimage. Bounded
+                    # by the same 1B-voxel gate so this materialization is
+                    # safe at this branch.
+                    if hasattr(neuron, 'chunks'):
+                        neuron = np.asarray(neuron)
+                    neuron = resize(neuron, new_shape, mode='constant', preserve_range=True, anti_aliasing=True)
                 logger.info(f"   Data rescaled to match model for labeling has shape: {neuron.shape}")
+
+            # If we streamed via zarr but did NOT resize (resolutions matched),
+            # materialize the zarr to numpy now for the downstream imwrite to
+            # nnU-Net_input. Bounded: this branch only fires when input/model
+            # resolutions are equal AND neuron is zarr (i.e., source was big
+            # enough to stream). For T_LARGE-class data this would be a 55 GB
+            # numpy alloc — but T_LARGE always has resZ != model_resZ so the
+            # branch above handles it. Future scale: if resolutions match for
+            # very large data, switch to a slab-streaming imwrite.
+            if hasattr(neuron, 'chunks') and not (settings.input_resZ != settings.model_resZ or
+                                                    settings.input_resXY != settings.model_resXY):
+                logger.info(
+                    f"   Materializing zarr-backed neuron for nnU-Net imwrite "
+                    f"({neuron.nbytes / 1e9:.2f} GB)")
+                _materialized = np.empty(neuron.shape, dtype=neuron.dtype)
+                _slab = 64
+                for _z in range(0, neuron.shape[0], _slab):
+                    _ze = min(_z + _slab, neuron.shape[0])
+                    _materialized[_z:_ze] = neuron[_z:_ze]
+                neuron = _materialized
+                if _resseg_workspace is not None:
+                    try:
+                        _resseg_workspace.cleanup()
+                    except Exception:
+                        pass
+                    _resseg_workspace = None
 
             # logger.info the  it will take for processing image by dividing the number of pixels by a scaling factor
             # limit variable to 2 decimal places
@@ -444,7 +597,7 @@ def nnunet_create_labels(inputdir, settings, locations, logger):
                 imwrite(
                     filepath,
                     neuron.astype(np.uint16),
-                    compression=('zlib', 1),
+                    compression='zlib', compressionargs={'level': 1},
                     photometric='minisblack',
                     metadata={'spacing': settings.input_resZ,
                               'unit': 'um',
@@ -453,6 +606,18 @@ def nnunet_create_labels(inputdir, settings, locations, logger):
                     imagej=not need_bigtiff,
                     bigtiff=need_bigtiff,
                 )
+
+            # Per-file streaming-ingest workspace cleanup. Reaches here when
+            # workspace was created but neither the chunked-resize nor the
+            # post-resize materialization branches ran the cleanup (e.g.,
+            # legacy small-image path with imread, or unusual code paths).
+            if _resseg_workspace is not None:
+                try:
+                    _resseg_workspace.cleanup()
+                except Exception as _cleanup_err:
+                    logger.warning(
+                        f"   resseg workspace cleanup failed: {_cleanup_err}")
+                _resseg_workspace = None
 
         # Run nnUnet over prepared files
         # initialize_nnUnet(settings)
@@ -545,7 +710,7 @@ def nnunet_create_labels(inputdir, settings, locations, logger):
 
                 logger.info(f"  Image {files[file]} has shape: {image.shape}")
 
-                imwrite(locations.labels + files[file], image.astype(np.uint8), compression=('zlib', 1), imagej=True,
+                imwrite(locations.labels + files[file], image.astype(np.uint8), compression='zlib', compressionargs={'level': 1}, imagej=True,
                         photometric='minisblack',
                         metadata={'spacing': settings.input_resZ, 'unit': 'um', 'axes': 'ZYX', 'mode': 'composite'},
                         resolution=(settings.input_resXY, settings.input_resXY))
@@ -590,15 +755,12 @@ def run_nnunet_predict(nnunet_predict_bat, input_dir, output_dir, dataset_id, nn
         str(settings.internal_py_path),
         str(settings.clean_launcher),
         str(nnunet_predict_bat),  # Target script
-        "-i", input_dir,
-        "-o", output_dir,
-        "-d", dataset_id,
-        "-c", nnunet_type,
+        "-i", str(input_dir),
+        "-o", str(output_dir),
+        "-d", str(dataset_id),
+        "-c", str(nnunet_type),
         "-f", "all"
     ]
-
-    # Convert to string for shell=True
-    cmd = ' '.join(f'"{arg}"' for arg in cmd_list)
 
     # Create clean environment
     env = os.environ.copy()
@@ -606,17 +768,15 @@ def run_nnunet_predict(nnunet_predict_bat, input_dir, output_dir, dataset_id, nn
     env['PYTHONPATH'] = ''
 
     # Preserve critical nnUNet environment variables
-    #logger.info("=== DEBUG: Preserving nnUNet variables ===")
-    # Preserve critical nnUNet environment variables
     nnunet_vars = ['nnUNet_raw', 'nnUNet_preprocessed', 'nnUNet_results']
     for var in nnunet_vars:
         if var in os.environ:
             env[var] = os.environ[var]
             logger.info(f"     Preserving {var} = {os.environ[var]}")
 
-    print(f"Executing command: {cmd}")
+    logger.info(f"     Running: {' '.join(str(a) for a in cmd_list)}")
 
-    return_code, stdout_out, stderr_out = run_process_with_logging(cmd, logger, env=env)
+    return_code, stdout_out, stderr_out = run_process_with_logging(cmd_list, logger, env=env)
 
     # Run the command
     if return_code != 0:
@@ -630,19 +790,31 @@ def run_nnunet_predict(nnunet_predict_bat, input_dir, output_dir, dataset_id, nn
 
 
 def run_process_with_logging(cmd, logger, env=None):
-    """Run process with logging, optionally with custom environment"""
+    """Run process with logging, optionally with custom environment.
+
+    cmd can be a list (recommended, uses shell=False for safe path handling)
+    or a string (uses shell=True for backward compatibility).
+    """
     # Use provided environment or default to current environment
     if env is None:
         env = os.environ.copy()
 
-    # Keep your existing process creation but add env parameter
+    # Use shell=False when cmd is a list (handles spaces in paths correctly)
+    use_shell = isinstance(cmd, str)
+
+    startupinfo = None
+    if os.name == 'nt' and not use_shell:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
     process = subprocess.Popen(cmd,
                                stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE,
-                               shell=True,
+                               shell=use_shell,
                                bufsize=1,
                                universal_newlines=True,
-                               env=env)  # Add environment parameter
+                               env=env,
+                               startupinfo=startupinfo)
 
     stdout_buffer = []
     stderr_buffer = []
@@ -691,7 +863,7 @@ def patch_images_for_nnunet(nn_input_dir, settings, logger):
         nZ, nY, nX = patches.shape[:3]
         base, idx = fn[:-4], 0
 
-        logger.info(f"    Patching {fn}  →  {nZ * nY * nX} blocks  (patch {psize}, stride {stride})")
+        logger.info(f"    Patching {fn} -> {nZ * nY * nX} blocks  (patch {psize}, stride {stride})")
         for z in range(nZ):
             for y in range(nY):
                 for x in range(nX):
@@ -760,32 +932,96 @@ def reassemble_patch_predictions(nn_output_dir, nn_input_dir,
                 max_lab = int(m)
         n_classes = max(2, max_lab + 1)
 
-        counts = np.zeros((n_classes, *shape), dtype=np.uint16)
+        # Check if full-volume vote array fits in RAM (~n_classes × volume × 2 bytes)
+        # Use Python int to avoid numpy int32 overflow on large volumes
+        import psutil
+        vote_bytes = int(n_classes) * int(shape[0]) * int(shape[1]) * int(shape[2]) * 2
+        avail_ram = psutil.virtual_memory().available
+        use_slab_reassembly = vote_bytes > avail_ram * 0.5
 
-        # pass 2 ─ accumulate votes
-        idx = 0
-        for z in range(nZ):
-            z0 = z * stride[0]
-            for y in range(nY):
-                y0 = y * stride[1]
-                for x in range(nX):
-                    x0 = x * stride[2]
-                    p = os.path.join(nn_output_dir, f"{base}_patch{idx:04d}.tif")
+        if use_slab_reassembly:
+            # Slab-by-slab reassembly for large volumes (avoids 40+ GB allocation).
+            # Dynamic slab depth: keep counts_slab under 30% of available RAM.
+            bytes_per_z = int(n_classes) * int(shape[1]) * int(shape[2]) * 2
+            slab_depth = max(1, int(avail_ram * 0.3 / bytes_per_z))
+            slab_depth = min(slab_depth, psize[0])  # Don't exceed patch Z-height
+            slab_mem = bytes_per_z * slab_depth / 1e9
+            logger.info(f"    Using slab-by-slab reassembly (vote array would need "
+                        f"{vote_bytes / 1e9:.1f} GB, available RAM: {avail_ram / 1e9:.1f} GB, "
+                        f"slab_depth={slab_depth}, slab_mem={slab_mem:.1f} GB)")
+            seg = np.zeros(shape, dtype=np.uint16)
+
+            # Pre-index patches by their Z-range for fast lookup
+            patch_index = []  # [(z0, y0, x0, idx), ...]
+            idx = 0
+            for z in range(nZ):
+                z0 = z * stride[0]
+                for y in range(nY):
+                    y0 = y * stride[1]
+                    for x in range(nX):
+                        x0 = x * stride[2]
+                        patch_index.append((z0, y0, x0, idx))
+                        idx += 1
+
+            for slab_z0 in range(0, shape[0], slab_depth):
+                slab_z1 = min(slab_z0 + slab_depth, shape[0])
+                slab_h = slab_z1 - slab_z0
+                counts_slab = np.zeros((n_classes, slab_h, shape[1], shape[2]), dtype=np.uint16)
+
+                for pz0, py0, px0, pidx in patch_index:
+                    pz1 = min(pz0 + psize[0], shape[0])
+                    # Skip patches that don't overlap this slab
+                    if pz1 <= slab_z0 or pz0 >= slab_z1:
+                        continue
+                    p = os.path.join(nn_output_dir, f"{base}_patch{pidx:04d}.tif")
                     if not os.path.exists(p):
-                        p = os.path.join(nn_output_dir, f"{base}_patch{idx:04d}_0000.tif")
-                    if os.path.exists(p):
-                        patch = imread(p)
-                        z1 = min(z0 + psize[0], shape[0])
-                        y1 = min(y0 + psize[1], shape[1])
-                        x1 = min(x0 + psize[2], shape[2])
-                        sub = patch[:z1 - z0, :y1 - y0, :x1 - x0]
-                        for c in range(n_classes):
-                            m = (sub == c)
-                            if m.any():
-                                counts[c, z0:z1, y0:y1, x0:x1] += m
-                    idx += 1
+                        p = os.path.join(nn_output_dir, f"{base}_patch{pidx:04d}_0000.tif")
+                    if not os.path.exists(p):
+                        continue
+                    patch = imread(p)
+                    py1 = min(py0 + psize[1], shape[1])
+                    px1 = min(px0 + psize[2], shape[2])
+                    sub = patch[:pz1 - pz0, :py1 - py0, :px1 - px0]
+                    # Compute overlap with this slab
+                    oz0 = max(pz0, slab_z0) - slab_z0  # local slab coord
+                    oz1 = min(pz1, slab_z1) - slab_z0
+                    sz0 = max(pz0, slab_z0) - pz0  # local patch coord
+                    sz1 = sz0 + (oz1 - oz0)
+                    for c in range(n_classes):
+                        m = (sub[sz0:sz1, :py1 - py0, :px1 - px0] == c)
+                        if m.any():
+                            counts_slab[c, oz0:oz1, py0:py1, px0:px1] += m
 
-        seg = np.argmax(counts, axis=0).astype(np.uint16)
+                seg[slab_z0:slab_z1] = np.argmax(counts_slab, axis=0).astype(np.uint16)
+                del counts_slab
+        else:
+            # Original full-volume approach (fits in RAM)
+            counts = np.zeros((n_classes, *shape), dtype=np.uint16)
+
+            idx = 0
+            for z in range(nZ):
+                z0 = z * stride[0]
+                for y in range(nY):
+                    y0 = y * stride[1]
+                    for x in range(nX):
+                        x0 = x * stride[2]
+                        p = os.path.join(nn_output_dir, f"{base}_patch{idx:04d}.tif")
+                        if not os.path.exists(p):
+                            p = os.path.join(nn_output_dir, f"{base}_patch{idx:04d}_0000.tif")
+                        if os.path.exists(p):
+                            patch = imread(p)
+                            z1 = min(z0 + psize[0], shape[0])
+                            y1 = min(y0 + psize[1], shape[1])
+                            x1 = min(x0 + psize[2], shape[2])
+                            sub = patch[:z1 - z0, :y1 - y0, :x1 - x0]
+                            for c in range(n_classes):
+                                m = (sub == c)
+                                if m.any():
+                                    counts[c, z0:z1, y0:y1, x0:x1] += m
+                        idx += 1
+
+            seg = np.argmax(counts, axis=0).astype(np.uint16)
+            del counts
         out_path = os.path.join(final_dir, f"{base_out}.tif")
         imwrite(out_path, seg, compression="zlib")
         logger.info(f"    Re-assembled: {base_out}.tif  [tiles: {len(have)}/{total_expected}, classes: {n_classes}]")

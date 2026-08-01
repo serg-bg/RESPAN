@@ -4,8 +4,8 @@ Created on Fri Jul 21 11:16:58 2023
 
 """
 __title__     = 'RESPAN'
-__version__   = '1.0.00'
-__date__      = "15 September, 2025"
+__version__   = '1.5.00'
+__date__      = "20 April, 2026"
 __author__    = 'Luke Hammond <luke.hammond@osumc.edu>'
 __license__   = 'MIT License (see LICENSE)'
 __copyright__ = 'Copyright © 2025 by Luke Hammond'
@@ -58,6 +58,16 @@ about_text = ("\nWe developed RESPAN to address a need for a comprehensive, accu
 
 import multiprocessing
 import sys
+
+# Force UTF-8 console output. Prevents Windows cp1252 logging crashes
+# when log messages contain non-ASCII chars (mu, arrows, etc.). No-op
+# when stdout is None (bundled --windowed exe) or already UTF-8.
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except (AttributeError, OSError):
+    pass
+
 import os
 import pickle
 import logging
@@ -112,11 +122,24 @@ else:
 
     active_env = Path(sys.base_prefix)           # respandev
     conda_root = active_env.parent.parent        # …\anaconda3
-    VENV_DIR   = conda_root / "envs" / DEV_ENV
-    PY_EXE = VENV_DIR / "python.exe"
-    if not PY_EXE.exists():
+
+    # Search for DEV_ENV — may be under a different conda root than active env
+    _candidate_roots = [
+        conda_root / "envs",                              # sibling of current env
+        Path.home() / "anaconda3" / "envs",                # default anaconda
+        Path.home() / "miniconda3" / "envs",               # default miniconda
+    ]
+    VENV_DIR = None
+    for _root in _candidate_roots:
+        _candidate = _root / DEV_ENV
+        if (_candidate / "python.exe").exists():
+            VENV_DIR = _candidate
+            break
+    if VENV_DIR is None:
         raise RuntimeError(
-            f"Dev env '{DEV_ENV}' not found at {VENV_DIR}. ")
+            f"Dev env '{DEV_ENV}' not found. Searched: "
+            + ", ".join(str(r / DEV_ENV) for r in _candidate_roots))
+    PY_EXE = VENV_DIR / "python.exe"
     INSTALL_DIR = Path(r'C:\Users\Luke_H')
     SELFNET_TRAINING_SCRIPT = APP_DIR / "SelfNet_Model_Training.py"
     SELFNET_INFERENCE_SCRIPT = APP_DIR / "SelfNet_Inference.py"
@@ -188,6 +211,20 @@ else:
     global_GUI_app = False
     global_respan_env = 'respan99'
 
+    # CUDA setup — dev machines may not have the CUDA toolkit installed system-wide.
+    # Search bundled dist DLLs so TensorFlow (CARE) and CuPy can find CUDA 11.x libs.
+    _cuda_search_dirs = [
+        Path("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.2/bin"),
+        Path("D:/RESPAN_v1_0_00/_internal/cuda/bin"),
+        Path("D:/RESPAN_v1_0_00/_internal/cuda"),
+    ]
+    for _d in _cuda_search_dirs:
+        if _d.is_dir():
+            os.environ.setdefault("CUDA_PATH", str(_d.parent if _d.name == "bin" else _d))
+            os.environ["PATH"] = str(_d) + os.pathsep + os.environ.get("PATH", "")
+            print(f"CUDA_PATH: {os.environ['CUDA_PATH']}")
+            break
+
     elastix_path = "C:/Program Files/elastix_5_2/"
     elastix_params = "D:/Dropbox/Github/RESPAN/RESPAN/Elastix_params"
 
@@ -204,7 +241,17 @@ def log_output(pipe, logger):
         logger.info(line.strip())
 
 def run_process_with_logging(cmd, logger):
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, universal_newlines=True, text=True)#, bufsize=1)
+    """Run a subprocess with logging. cmd can be a list (recommended) or string."""
+    use_shell = isinstance(cmd, str)
+
+    startupinfo = None
+    if os.name == 'nt' and not use_shell:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               shell=use_shell, universal_newlines=True, text=True,
+                               startupinfo=startupinfo)
 
     # Start threads to read stdout and stderr
     stdout_thread = threading.Thread(target=log_output, args=(process.stdout, logger))
@@ -366,6 +413,17 @@ class EnvSetup(QThread):
         #self.logger.info("Installing nnUNet in embedded environment...")
         self.logger.info(f"First time running RESPAN, please allow a few minutes to complete installation...")
 
+        # Subprocess env: override PIP_REQUIRE_VIRTUALENV in case the host
+        # machine has it set (pip will otherwise refuse with "Could not find
+        # an activated virtualenv"). The bundled respan env is fully self-
+        # contained and doesn't need to appear "activated" to pip.
+        import os as _os
+        _pip_env = _os.environ.copy()
+        _pip_env['PIP_REQUIRE_VIRTUALENV'] = 'false'
+        # Also tell pip to NOT read user/global pip config files that might
+        # impose additional constraints (e.g. --require-venv, index-url).
+        _pip_env['PIP_CONFIG_FILE'] = _os.devnull
+
         try:
             # Simple pip install using the embedded Python
             cmd = [
@@ -378,7 +436,8 @@ class EnvSetup(QThread):
                 cmd,
                 capture_output=True,
                 text=True,
-                check=True
+                check=True,
+                env=_pip_env,
             )
 
             # Mark as installed with current APP_DIR path
@@ -461,6 +520,17 @@ class RESPANAnalysis(QWidget):
         super().__init__()
         self.initUI()
         self.log_display.append("Initializing RESPAN and checking environment...\n")
+
+        # Log app location and warn about potential path issues
+        app_path = str(APP_DIR)
+        self.log_display.append(f"RESPAN location: {app_path}")
+        if ' ' in app_path:
+            self.log_display.append("  WARNING: RESPAN path contains spaces, which may cause issues with some operations.")
+            self.log_display.append("  Consider moving RESPAN to a path without spaces (e.g., C:\\RESPAN\\)\n")
+        if 'OneDrive' in app_path:
+            self.log_display.append("  WARNING: RESPAN appears to be running from a OneDrive-synced folder.")
+            self.log_display.append("  Cloud sync can interfere with processing. Consider using a local folder.\n")
+
         #if global_GUI_app == True:
             #self.load_dlls()
         self.check_gpu_availability()
@@ -482,9 +552,9 @@ class RESPANAnalysis(QWidget):
             self.log_display.append(f"Error loading DLL: {e}")
         except Exception as e:
             self.log_display.append(f"dll_dir: {dll_dir}")
-            self.log_display.append(f"path: {os.getenv['PATH']}")
-            self.log_display.append(f"cuda path: {os.getenv['CUDA_PATH']}")
-            self.log_display.append(f"ld lib path: {os.egetenv['LD_LIBRARY_PATH']}")
+            self.log_display.append(f"path: {os.environ.get('PATH', 'Not set')}")
+            self.log_display.append(f"cuda path: {os.environ.get('CUDA_PATH', 'Not set')}")
+            self.log_display.append(f"ld lib path: {os.environ.get('LD_LIBRARY_PATH', 'Not set')}")
             self.log_display.append(f"Failed to load cusolver64_11.dll: {str(e)}")
 
 
@@ -704,6 +774,90 @@ class RESPANAnalysis(QWidget):
             #options_layout1.addLayout(h_an_opt)
             options_layout1.setAlignment(Qt.AlignTop)
 
+            # -----------------------------------------------------------------
+            # Spine Thresholding — spurious-neck detection + head-keep option
+            # -----------------------------------------------------------------
+            options_thresholding = QGroupBox("Spine Thresholding (optional quality filter)")
+            options_thresholding.setStyleSheet("QGroupBox::title {"
+                                               "subcontrol-origin: margin;"
+                                               "subcontrol-position: top left;"
+                                               "padding: 2px;"
+                                               "color: black;"
+                                               "}")
+            options_thresholding.setFont(titlefont)
+            options_thresh_layout = QVBoxLayout()
+            options_thresholding.setLayout(options_thresh_layout)
+
+            self.spurious_length_label = QLabel("Max neck path length (µm) before a spine is eligible for spurious-flagging:")
+            self.spurious_length_input = QLineEdit("1.0")
+            self.spurious_length_input.setFixedWidth(90)
+            self.spurious_length_input.setToolTip(
+                "Only spines whose measured neck path length EXCEEDS this value in "
+                "µm become candidates for the spurious filter. Real biological "
+                "spine necks are typically 0.2-1.5 µm; pathfinder-synthesized necks "
+                "through noise are commonly longer. Lower → more aggressive, higher "
+                "→ more permissive. Default 1.0 µm. The AND-gate with nnU-Net "
+                "support protects real necks with genuine segmentation from being "
+                "dropped purely on length."
+            )
+            h_spu_len = QHBoxLayout()
+            h_spu_len.addWidget(self.spurious_length_label)
+            h_spu_len.addWidget(self.spurious_length_input)
+
+            self.spurious_support_label = QLabel("Minimum nnU-Net neck support (fraction 0-1):")
+            self.spurious_support_input = QLineEdit("0.2")
+            self.spurious_support_input.setFixedWidth(90)
+            self.spurious_support_input.setToolTip(
+                "Fraction of the assigned neck voxels that must coincide with the "
+                "original nnU-Net neck prediction. Spines BELOW this threshold AND "
+                "above the length threshold are flagged. 0.2 means necks with "
+                "<20% nnU-Net backing are candidates. Lower → allow more "
+                "pathfinder-synthesized necks, higher → stricter."
+            )
+            h_spu_sup = QHBoxLayout()
+            h_spu_sup.addWidget(self.spurious_support_label)
+            h_spu_sup.addWidget(self.spurious_support_input)
+
+            # Drop-filter master toggle — post-bridge cleanup filters
+            # (drop_disconnected_neck_fragments, drop_wrong_direction_neck_fragments)
+            # are YAML-only advanced options, loaded from SpuriousNeck block with
+            # default True. They operate on `connected_necks` per-label and do not
+            # affect filopodia recovery (which is gated by a separate checkbox in
+            # the "Additional Options" group).
+            self.drop_spurious_necks = QCheckBox(
+                "Drop spurious necks (AND-gate: length + low nnU-Net support)"
+            )
+            self.drop_spurious_necks.setChecked(True)
+            self.drop_spurious_necks.setToolTip(
+                "When ON (default): spines flagged by the AND-gate above have their "
+                "NECK voxels removed. The head is retained and reclassified as "
+                "partial-spine (kept if within distance to dendrite, dropped if "
+                "'Keep partial spines' is unchecked). When OFF: the flag is recorded "
+                "to neck_path_confidence.csv but no voxels are removed. "
+                "To drop BOTH neck and head (aggressive mode), set YAML "
+                "SpuriousNeck.exclude_mode to 'both'."
+            )
+
+            self.keep_head_if_flagged = QCheckBox(
+                "Keep spine head even when neck can't be confidently generated"
+            )
+            self.keep_head_if_flagged.setChecked(False)
+            self.keep_head_if_flagged.setToolTip(
+                "When a neck fails the spurious-neck AND-gate above and the user "
+                "has set YAML SpuriousNeck.exclude_mode=both (aggressive drop), "
+                "this toggle downgrades the behaviour to 'neck_only' — the head "
+                "stays in detected_spines.csv with neck metrics zeroed, rather "
+                "than being removed entirely. No effect under the default "
+                "exclude_mode=neck_only because heads are already retained. "
+                "Advanced reviewer option."
+            )
+
+            options_thresh_layout.addLayout(h_spu_len)
+            options_thresh_layout.addLayout(h_spu_sup)
+            options_thresh_layout.addWidget(self.drop_spurious_necks)
+            options_thresh_layout.addWidget(self.keep_head_if_flagged)
+            options_thresh_layout.setAlignment(Qt.AlignTop)
+
             '''
             options_layout1.addWidget(self.neuron_channel_label)
             options_layout1.addWidget(self.neuron_channel_input)
@@ -764,8 +918,51 @@ class RESPANAnalysis(QWidget):
             self.save_validation.setChecked(True)
             self.neck_generation = QCheckBox("Perform spine neck generation")
             self.neck_generation.setChecked(True)
+            self.recover_filopodia = QCheckBox(
+                "Recover filopodia from orphan nnU-Net neck fragments")
+            self.recover_filopodia.setChecked(False)
+            self.recover_filopodia.setToolTip(
+                "Preserve nnU-Net-predicted necks that have no associated spine head "
+                "as filopodia. Carves a small head from the neck tip (no synthesis). "
+                "Off by default — enables new behaviour on top of normal neck "
+                "assignment. Filopodia are marked with spine_type='filopodia' in the CSV.")
+            self.dendrite_repair = QCheckBox(
+                "Dendrite repair (reconnect fragments without dilating)")
+            self.dendrite_repair.setChecked(False)
+            self.dendrite_repair.setToolTip(
+                "Bridge dendrite fragments that were broken by discontinuous nnU-Net "
+                "predictions. Operates in XY only and only fills background voxels "
+                "along the bridge path — original dendrite morphology is preserved. "
+                "Merged fragments adopt the parent (largest CC) label.")
+            self.dendrite_repair_max_dist_um = QLineEdit("2.0")
+            self.dendrite_repair_max_dist_um.setFixedWidth(60)
+            self.dendrite_repair_max_dist_um.setToolTip(
+                "Maximum XY gap (microns) to bridge between dendrite fragments. "
+                "Default 2.0 µm.")
+            self.detect_multi_head_spines = QCheckBox(
+                "Multi-head spine detection (detects multi-headed spines, "
+                "analyzes heads as sub features of these spines)")
+            self.detect_multi_head_spines.setChecked(False)
+            self.detect_multi_head_spines.setToolTip(
+                "Group physically connected spine heads under one parent ID. "
+                "Two heads belong to the same multi-head group when their "
+                "territories (head + assigned neck + nnU-Net neck) are "
+                "26-connected. Adds parent_spine_id, head_index, "
+                "multi_head_group_size columns to Detected_spines.csv, plus a "
+                "Multi_Head_Spine_Groups.csv aggregate file and a 5th channel "
+                "in the validation MIP showing the group ID.")
+            self.keep_partial_spines = QCheckBox(
+                "Keep partial spines (head detected but neck path occluded by a "
+                "nearby spine)")
+            self.keep_partial_spines.setChecked(True)
+            self.keep_partial_spines.setToolTip(
+                "Spines where insufficient information exists to complete the neck "
+                "path to the dendrite (e.g. path occluded by a nearby spine). The "
+                "head is kept in the output with distance metrics; neck metrics are "
+                "zeroed and spine_type='partial-spine'. Uncheck to drop these spines "
+                "entirely from the output.")
 
-            self.save_intermediate = QCheckBox("Additional data and logging (3D volumes of dendrites, spines, meshes,and data for detailed inspection)")
+            self.save_intermediate = QCheckBox("Save intermediate data (3D spine volumes, MIPs, meshes for detailed inspection)")
             self.save_intermediate.setChecked(False)
             self.nnUNet_patching = QCheckBox("Enable patching for nnUNet (recommended for datasets >1GB)")
             self.nnUNet_patching.setChecked(False)
@@ -785,6 +982,17 @@ class RESPANAnalysis(QWidget):
             #save_options = QHBoxLayout()
             options_layout2.addWidget(self.save_validation)
             options_layout2.addWidget(self.neck_generation)
+            options_layout2.addWidget(self.recover_filopodia)
+            # Dendrite repair: checkbox + max-distance input on a single row
+            _dr_row = QHBoxLayout()
+            _dr_row.addWidget(self.dendrite_repair)
+            _dr_row.addWidget(QLabel("max gap (µm):"))
+            _dr_row.addWidget(self.dendrite_repair_max_dist_um)
+            _dr_row.addStretch(1)
+            _dr_wrap = QWidget(); _dr_wrap.setLayout(_dr_row)
+            options_layout2.addWidget(_dr_wrap)
+            options_layout2.addWidget(self.detect_multi_head_spines)
+            options_layout2.addWidget(self.keep_partial_spines)
             options_layout2.addWidget(self.save_intermediate)
             options_layout2.addWidget(self.nnUNet_patching)
 
@@ -809,6 +1017,7 @@ class RESPANAnalysis(QWidget):
             #input_data_and_res.addWidget(dir_options)
             left_side_options.addWidget(dir_options, alignment=Qt.AlignTop)
             left_side_options.addWidget(options_group1, alignment=Qt.AlignTop)
+            left_side_options.addWidget(options_thresholding, alignment=Qt.AlignTop)
 
             right_side_options = QVBoxLayout()
             right_side_options.addWidget(res_options, alignment=Qt.AlignTop)
@@ -877,10 +1086,22 @@ class RESPANAnalysis(QWidget):
                 min_dend = variables_dict.get('min_dend', None)
                 spine_vol = variables_dict.get('spine_vol', None)
                 spine_dist = variables_dict.get('spine_dist', None)
+                spurious_length_min_um = variables_dict.get('spurious_length_min_um', "1.0")
+                spurious_nnunet_support_min = variables_dict.get('spurious_nnunet_support_min', "0.2")
+                spurious_keep_head_if_flagged = variables_dict.get('spurious_keep_head_if_flagged', False)
+                drop_spurious_necks = variables_dict.get('drop_spurious_necks', True)
                 #analysis_meth = variables_dict.get('analysis_meth', None)
 
                 image_restore = variables_dict.get('image_restore', None)
                 neck_generation = variables_dict.get('neck_generation', None)
+                recover_filopodia = variables_dict.get('recover_filopodia', False)
+                # Accept legacy 'intelligent_dendrite_repair' key for backward compat with old pkl state files.
+                dendrite_repair = variables_dict.get(
+                    'dendrite_repair',
+                    variables_dict.get('intelligent_dendrite_repair', False))
+                dendrite_repair_max_dist_um = variables_dict.get('dendrite_repair_max_dist_um', "2.0")
+                detect_multi_head_spines = variables_dict.get('detect_multi_head_spines', False)
+                keep_partial_spines = variables_dict.get('keep_partial_spines', True)
                 axial_restore = variables_dict.get('axial_restore', None)
                 swc_gen = variables_dict.get('swc_gen', None)
                 dask_enabled = variables_dict.get('dask_enabled', None)
@@ -909,16 +1130,30 @@ class RESPANAnalysis(QWidget):
                 self.float_input_1.setText(str(min_dend))
                 self.float_input_2.setText(str(spine_vol))
                 self.float_input_3.setText(str(spine_dist))
+                self.spurious_length_input.setText(str(spurious_length_min_um))
+                self.spurious_support_input.setText(str(spurious_nnunet_support_min))
+                self.keep_head_if_flagged.setChecked(bool(spurious_keep_head_if_flagged))
+                self.drop_spurious_necks.setChecked(bool(drop_spurious_necks))
                 #self.analysis_method.setCurrentIndex(int(analysis_meth))
 
-                self.image_restore_opt.setChecked(image_restore)
-                self.axial_restore_opt.setChecked(axial_restore)
-                self.neck_generation.setChecked(neck_generation)
-                self.swc_gen.setChecked(swc_gen)
-                self.dask_enabled.setChecked(dask_enabled)
-                self.nnUNet_patching.setChecked(nnUNet_patching)
-                self.save_validation.setChecked(save_val_data)
-                self.save_intermediate.setChecked(save_int_data)
+                # Legacy pkl state files may have None for checkboxes added in
+                # later versions. Default to the current widget's checked-state
+                # so missing keys don't crash the GUI on load.
+                def _bool_or_keep(val, widget):
+                    return bool(val) if val is not None else widget.isChecked()
+                self.image_restore_opt.setChecked(_bool_or_keep(image_restore, self.image_restore_opt))
+                self.axial_restore_opt.setChecked(_bool_or_keep(axial_restore, self.axial_restore_opt))
+                self.neck_generation.setChecked(_bool_or_keep(neck_generation, self.neck_generation))
+                self.recover_filopodia.setChecked(_bool_or_keep(recover_filopodia, self.recover_filopodia))
+                self.dendrite_repair.setChecked(_bool_or_keep(dendrite_repair, self.dendrite_repair))
+                self.dendrite_repair_max_dist_um.setText(str(dendrite_repair_max_dist_um))
+                self.detect_multi_head_spines.setChecked(_bool_or_keep(detect_multi_head_spines, self.detect_multi_head_spines))
+                self.keep_partial_spines.setChecked(_bool_or_keep(keep_partial_spines, self.keep_partial_spines))
+                self.swc_gen.setChecked(_bool_or_keep(swc_gen, self.swc_gen))
+                self.dask_enabled.setChecked(_bool_or_keep(dask_enabled, self.dask_enabled))
+                self.nnUNet_patching.setChecked(_bool_or_keep(nnUNet_patching, self.nnUNet_patching))
+                self.save_validation.setChecked(_bool_or_keep(save_val_data, self.save_validation))
+                self.save_intermediate.setChecked(_bool_or_keep(save_int_data, self.save_intermediate))
                 #self.HistMatch.setChecked(hist_match)
                 self.Track.setChecked(spine_track)
                 self.reg_method.setCurrentIndex(int(reg_meth))
@@ -1059,10 +1294,20 @@ class RESPANAnalysis(QWidget):
         spine_dist = str(self.float_input_3.text())
         #analysis_meth = self.analysis_method.currentIndex()
 
+        # Spine thresholding (optional spurious-neck filter)
+        spurious_length_min_um = str(self.spurious_length_input.text())
+        spurious_nnunet_support_min = str(self.spurious_support_input.text())
+        spurious_keep_head_if_flagged = self.keep_head_if_flagged.isChecked()
+        drop_spurious_necks = self.drop_spurious_necks.isChecked()
+
         image_restore = self.image_restore_opt.isChecked()
         axial_restore = self.axial_restore_opt.isChecked()
         swc_gen = self.swc_gen.isChecked()
         neck_generation = self.neck_generation.isChecked()
+        recover_filopodia = self.recover_filopodia.isChecked()
+        dendrite_repair = self.dendrite_repair.isChecked()
+        dendrite_repair_max_dist_um = str(self.dendrite_repair_max_dist_um.text())
+        detect_multi_head_spines = self.detect_multi_head_spines.isChecked()
         save_int_data = self.save_intermediate.isChecked()
         dask_enabled = self.dask_enabled.isChecked()
         nnUNet_patching = self.nnUNet_patching.isChecked()
@@ -1088,8 +1333,17 @@ class RESPANAnalysis(QWidget):
             'min_dend': min_dend,
             'spine_vol': spine_vol,
             'spine_dist': spine_dist,
+            'spurious_length_min_um': spurious_length_min_um,
+            'spurious_nnunet_support_min': spurious_nnunet_support_min,
+            'spurious_keep_head_if_flagged': spurious_keep_head_if_flagged,
+            'drop_spurious_necks': drop_spurious_necks,
             #'analysis_meth': analysis_meth,
             'neck_generation': neck_generation,
+            'recover_filopodia': recover_filopodia,
+            'dendrite_repair': dendrite_repair,
+            'dendrite_repair_max_dist_um': dendrite_repair_max_dist_um,
+            'detect_multi_head_spines': detect_multi_head_spines,
+            'keep_partial_spines': keep_partial_spines,
             'image_restore': image_restore,
             'axial_restore': axial_restore,
             'swc_gen': swc_gen,
@@ -1190,10 +1444,29 @@ class RESPANAnalysis(QWidget):
             self.progress.setVisible(False)
             return
 
+        # Spine thresholding (optional — parsed for worker to attach to settings)
+        try:
+            spurious_length_min_um = float(self.spurious_length_input.text())
+            spurious_nnunet_support_min = float(self.spurious_support_input.text())
+        except ValueError:
+            QMessageBox.critical(self, "Error", "Invalid input in Spine Thresholding section.")
+            self.progress.setVisible(False)
+            return
+        spurious_keep_head_if_flagged = self.keep_head_if_flagged.isChecked()
+        drop_spurious_necks = self.drop_spurious_necks.isChecked()
+
         reg_method =  str(self.reg_method.currentText())
         analysis_method = "Whole Neuron"# str(self.analysis_method.currentText())
 
         neck_generation = self.neck_generation.isChecked()
+        recover_filopodia = self.recover_filopodia.isChecked()
+        dendrite_repair = self.dendrite_repair.isChecked()
+        try:
+            dendrite_repair_max_dist_um = float(self.dendrite_repair_max_dist_um.text())
+        except (ValueError, AttributeError):
+            dendrite_repair_max_dist_um = 2.0
+        detect_multi_head_spines = self.detect_multi_head_spines.isChecked()
+        keep_partial_spines = self.keep_partial_spines.isChecked()
         image_restore = self.image_restore_opt.isChecked()
         axial_restore = self.axial_restore_opt.isChecked()
         save_intermediate = self.save_intermediate.isChecked()
@@ -1209,6 +1482,52 @@ class RESPANAnalysis(QWidget):
         model_type = str(self.model_type.currentText())
 
         directory =  directory + "/"
+
+        # --- Path robustness checks ---
+        for label, path in [("Data directory", directory), ("Model directory", model_dir)]:
+            if ' ' in path:
+                reply = QMessageBox.warning(self, "Path Contains Spaces",
+                    f"{label} path contains spaces:\n{path}\n\n"
+                    "Spaces in file paths can cause issues with some processing steps.\n"
+                    "Consider moving data to a path without spaces (e.g., C:\\RESPAN_Data\\).\n\n"
+                    "Continue anyway?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if reply == QMessageBox.No:
+                    self.progress.setVisible(False)
+                    return
+
+            if 'OneDrive' in path:
+                reply = QMessageBox.warning(self, "Cloud Sync Path Detected",
+                    f"{label} appears to be in a OneDrive folder:\n{path}\n\n"
+                    "OneDrive file syncing can interfere with RESPAN processing.\n"
+                    "We recommend using a local folder (e.g., C:\\RESPAN_Data\\).\n\n"
+                    "Continue anyway?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if reply == QMessageBox.No:
+                    self.progress.setVisible(False)
+                    return
+
+        # Check data directory has valid subfolders
+        try:
+            dir_contents = os.listdir(directory)
+            has_subfolders = any(os.path.isdir(os.path.join(directory, d)) for d in dir_contents)
+        except OSError:
+            has_subfolders = False
+
+        if not has_subfolders:
+            QMessageBox.critical(self, "Invalid Data Directory",
+                "The selected data directory contains no subfolders.\n\n"
+                "RESPAN expects datasets organized as:\n"
+                "  data_directory/\n"
+                "    dataset_1/\n"
+                "      Analysis_Settings.yaml\n"
+                "      [image files]\n"
+                "    dataset_2/\n"
+                "      Analysis_Settings.yaml\n"
+                "      [image files]\n\n"
+                "Please see the RESPAN user guide for dataset preparation instructions.")
+            self.progress.setVisible(False)
+            return
 
         if global_GUI_app == False:
             RESPAN = RESPAN +"/"
@@ -1230,7 +1549,16 @@ class RESPANAnalysis(QWidget):
                                      inputxy, inputz, modelxy, modelz, neuron_ch, analysis_method,
                                      image_restore, axial_restore, swc_gen,
                                      min_dendrite_vol, spine_vol, spine_dist, #HistMatch,
-                                     Track, reg_method, use_yaml_res, second_pass, model_type, self.logger)
+                                     Track, reg_method, use_yaml_res, second_pass, model_type, self.logger,
+                                     spurious_length_min_um=spurious_length_min_um,
+                                     spurious_nnunet_support_min=spurious_nnunet_support_min,
+                                     spurious_keep_head_if_flagged=spurious_keep_head_if_flagged,
+                                     drop_spurious_necks=drop_spurious_necks,
+                                     recover_filopodia=recover_filopodia,
+                                     dendrite_repair=dendrite_repair,
+                                     dendrite_repair_max_dist_um=dendrite_repair_max_dist_um,
+                                     detect_multi_head_spines=detect_multi_head_spines,
+                                     keep_partial_spines=keep_partial_spines)
 
 
         self.worker.task_done.connect(self.on_task_done)
@@ -1258,7 +1586,16 @@ class AnalysisWorker(QThread):
                                      inputxy, inputz, modelxy, modelz, neuron_ch, analysis_method,
                                      image_restore, axial_restore, swc,
                                      min_dendrite_vol, spine_vol, spine_dist, #HistMatch,
-                                     Track, reg_method, use_yaml_res, second_pass, model_type, logger):
+                                     Track, reg_method, use_yaml_res, second_pass, model_type, logger,
+                                     spurious_length_min_um=1.0,
+                                     spurious_nnunet_support_min=0.2,
+                                     spurious_keep_head_if_flagged=False,
+                                     drop_spurious_necks=True,
+                                     recover_filopodia=False,
+                                     dendrite_repair=False,
+                                     dendrite_repair_max_dist_um=2.0,
+                                     detect_multi_head_spines=False,
+                                     keep_partial_spines=True):
 
 
         super().__init__()
@@ -1266,6 +1603,11 @@ class AnalysisWorker(QThread):
         self.directory = directory
         self.model_dir = model_dir
         self.neck_generation = neck_generation
+        self.recover_filopodia = recover_filopodia
+        self.dendrite_repair = dendrite_repair
+        self.dendrite_repair_max_dist_um = dendrite_repair_max_dist_um
+        self.detect_multi_head_spines = detect_multi_head_spines
+        self.keep_partial_spines = keep_partial_spines
         self.save_intermediate = save_intermediate
         self.dask_enabled = dask_enabled
         self.nnUNet_patching = nnUNet_patching
@@ -1289,6 +1631,11 @@ class AnalysisWorker(QThread):
         self.use_yaml_res = use_yaml_res
         #self.second_pass = second_pass
         self.model_type = model_type
+        # Spine thresholding — passed into settings before pipeline run
+        self.spurious_length_min_um = spurious_length_min_um
+        self.spurious_nnunet_support_min = spurious_nnunet_support_min
+        self.spurious_keep_head_if_flagged = spurious_keep_head_if_flagged
+        self.drop_spurious_necks = drop_spurious_necks
 
     def run(self):
         self.is_running = True
@@ -1303,21 +1650,34 @@ class AnalysisWorker(QThread):
 
             if self.directory == "No data directory selected." or not self.directory:
                 self.logger.info("No directory has been selected. Please select a valid data directory first.")
+                self.task_done.emit("No directory selected.")
                 return
             if not os.path.exists(self.directory):
                 self.logger.info(f"Directory does not exist: {self.directory}")
+                self.task_done.emit("Directory does not exist.")
                 return
             if len(os.listdir(self.directory)) == 0:
                 self.logger.info(
                     "Selected directory contains no subfolders! \nPlease ensure your datasets are stored in subfolders nested within the selected directory.")
+                self.task_done.emit("Empty directory.")
                 return
 
+            processed_count = 0
+            skipped_subfolders = []
 
             for subfolder in os.listdir(self.directory):
                 subfolder_path = os.path.join(self.directory, subfolder)
                 if os.path.isdir(subfolder_path):
                     subfolder_path = subfolder_path +"/"
-                    #print(f"Processing subfolder: {subfolder_path}")
+
+                    # Check for Analysis_Settings.yaml before attempting to load
+                    settings_path = os.path.join(subfolder_path, "Analysis_Settings.yaml")
+                    if not os.path.exists(settings_path):
+                        self.logger.info(f"  Skipping '{subfolder}': No Analysis_Settings.yaml found.")
+                        skipped_subfolders.append(subfolder)
+                        continue
+
+                    processed_count += 1
                     #Load in experiment parameters and analysis settings
                     settings, locations = main.initialize_RESPAN(subfolder_path)
 
@@ -1364,6 +1724,11 @@ class AnalysisWorker(QThread):
                     settings.nnunet_predict_bat = nnunet_predict_bat
 
                     settings.neck_generation = self.neck_generation
+                    settings.recover_filopodia = self.recover_filopodia
+                    settings.dendrite_repair = bool(self.dendrite_repair)
+                    settings.dendrite_repair_max_dist_um = float(self.dendrite_repair_max_dist_um)
+                    settings.detect_multi_head_spines = bool(self.detect_multi_head_spines)
+                    settings.keep_partial_spines = self.keep_partial_spines
 
                     #basepath for selfnet
                     settings.basepath = base_path
@@ -1379,22 +1744,33 @@ class AnalysisWorker(QThread):
                     settings.min_dendrite_vol = round(self.min_dendrite_vol / settings.input_resXY/settings.input_resXY/settings.input_resZ, 0)
                     settings.neuron_spine_size = [round(x / (settings.input_resXY*settings.input_resXY*settings.input_resZ),0) for x in self.spine_vol]
                     settings.neuron_spine_dist = round(self.spine_dist / (settings.input_resXY),2)
+                    # Override YAML spurious-neck thresholds with GUI values.
+                    settings.spurious_path_length_min_um = float(self.spurious_length_min_um)
+                    settings.spurious_nnunet_support_min = float(self.spurious_nnunet_support_min)
+                    settings.spurious_keep_head_if_flagged = bool(self.spurious_keep_head_if_flagged)
+                    # GUI master toggle: checked = neck_only (head retained,
+                    # reclassified as partial-spine). unchecked = flag_only
+                    # (no voxel drops, CSV-only flag). YAML override for 'both'.
+                    settings.spurious_exclude_mode = (
+                        'neck_only' if bool(self.drop_spurious_necks) else 'flag_only')
+                    # drop_disconnected_neck_fragments and
+                    # drop_wrong_direction_neck_fragments are YAML-only advanced
+                    # options — loaded in Main.py SpuriousNeck block with default
+                    # True. GUI does not override; users can disable via YAML.
                     settings.HistMatch = False #self.HistMatch
                     settings.Track = self.Track
                     settings.reg_method = self.reg_method
-                    if self.save_intermediate == True:
-                        settings.additional_logging = True
-                        settings.checkmem = True
-                    else:
-                        settings.additional_logging = False
-                        settings.checkmem = False
+                    # Logging and memory tracking are always on (fast, console only).
+                    # save_intermediate_data controls disk-heavy spine array/MIP exports.
+                    settings.additional_logging = True
+                    settings.checkmem = True
                     settings.additional_logging_dev = additional_logging_dev
                     #settings.second_pass = self.second_pass
                     settings.second_pass = False
 
                     settings.patch_for_nnunet = self.nnUNet_patching
-                    settings.nnunet_patch_size = (64, 512, 512)
-                    settings.nnunet_stride = tuple(int(p*0.9) for p in settings.nnunet_patch_size)
+                    settings.nnunet_patch_size = (256, 512, 512)
+                    settings.nnunet_stride = tuple(int(p*0.75) for p in settings.nnunet_patch_size)
 
                     settings.use_vox_measurements = False
                     if self.dask_enabled:
@@ -1485,6 +1861,20 @@ class AnalysisWorker(QThread):
                         self.logger.info("Error: nnUNet environment not created or set correctly.")
                         self.logger.info(" Path set to:" + global_env_path + '/' + global_respan_env + '/')
                         self.logger.info(" Please check installation, or that paths set correctly in Analysis_Settings.yaml")
+
+            if processed_count == 0:
+                self.logger.info("\nNo valid dataset subfolders were found in the selected directory.")
+                self.logger.info("RESPAN expects each dataset to be in its own subfolder, containing an Analysis_Settings.yaml file.")
+                self.logger.info("\nExpected structure:")
+                self.logger.info("  selected_directory/")
+                self.logger.info("    dataset_1/")
+                self.logger.info("      Analysis_Settings.yaml")
+                self.logger.info("      [image files]")
+
+            if skipped_subfolders:
+                self.logger.info(f"\nSkipped {len(skipped_subfolders)} subfolder(s) due to missing Analysis_Settings.yaml:")
+                for name in skipped_subfolders:
+                    self.logger.info(f"  - {name}")
 
             self.task_done.emit("")
             self.is_running = False

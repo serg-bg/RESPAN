@@ -58,6 +58,8 @@ import RESPAN.ImageAnalysis.ImageAnalysis as imgan
 import RESPAN.ImageAnalysis.Validation as val
 import RESPAN.ImageAnalysis.SpineTracking as strk
 import RESPAN.ImageAnalysis.ModelTraining as mt
+import RESPAN.ImageAnalysis.Segmentation_and_Restoration as sr
+import RESPAN.ImageAnalysis.IO as io
 
 
 #analysis
@@ -71,4 +73,4 @@ __all__ = ['sys', 'os', 'tifffile', 'time', 'np',
            'plt', 'figure', 'exposure', 
            'segmentation', 'imread', 'imsave', 'imshow',  'util', 'img_as_ubyte',
            'ndi', 'clear_output',
-           'display', 'main', 'timer', 'imgan', 'val', 'strk', 'mt'];
+           'display', 'main', 'timer', 'imgan', 'val', 'strk', 'mt', 'sr', 'io',];

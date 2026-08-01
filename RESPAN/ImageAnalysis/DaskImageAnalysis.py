@@ -2684,7 +2684,7 @@ def extend_objects_GPU_single_dask(objects, target_objects, intensity, settings,
                     intensity_subvolume,
                     target_subvolume
                 ], axis=1)
-                imwrite(tiff_filename, multichannel_subvolume.astype(np.uint16), compression=('zlib', 1), imagej=True,
+                imwrite(tiff_filename, multichannel_subvolume.astype(np.uint16), compression='zlib', compressionargs={'level': 1}, imagej=True,
                         photometric='minisblack', metadata={'spacing': settings.input_resZ, 'unit': 'um', 'axes': 'ZCYX'})
 
 

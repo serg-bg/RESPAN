@@ -1,0 +1,215 @@
+%% RESPAN Pipeline Flow — GPU-Accelerated Dendritic Spine Analysis
+%% Entry points: GUI (RESPAN_GUI_DIST.py), Batch (RESPAN_Batch.py), API (from RESPAN.Environment import *)
+%% Color key: blue=entry, orange=GPU, green=segmentation, purple=tracking, red=core pipeline
+
+flowchart TD
+    %% ═══════════════════════════════════════════════
+    %% ENTRY & INITIALIZATION
+    %% ═══════════════════════════════════════════════
+
+    ENTRY["<b>Entry Points</b><br/>GUI: RESPAN_GUI_DIST.py<br/>Batch: RESPAN_Batch.py<br/>API: from RESPAN.Environment import *"]
+    INIT["initialize_RESPAN(data_dir)<br/>→ Create_Settings (YAML)<br/>→ Create_Locations (dirs)<br/>→ create_dirs"]
+
+    ENTRY --> INIT
+    INIT --> RESTORE_SEG
+
+    style ENTRY fill:#4a90d9,color:#fff,stroke:#2c5f8a
+    style INIT fill:#4a90d9,color:#fff,stroke:#2c5f8a
+
+    %% ═══════════════════════════════════════════════
+    %% RESTORATION & SEGMENTATION
+    %% ═══════════════════════════════════════════════
+
+    subgraph SEG["Restoration & Segmentation"]
+        direction TB
+        RESTORE_SEG["restore_and_segment()<br/><i>Segmentation_and_Restoration.py</i>"]
+
+        RESTORE_SEG --> REST_BRANCH{"Restoration<br/>Mode?"}
+
+        REST_BRANCH -->|"CARE + SelfNet"| CARE["restore_image()<br/>CARE model (TF/csbdeep)<br/>Per-channel denoising"]
+        REST_BRANCH -->|"CARE only"| CARE_ONLY["restore_image()<br/>CARE model"]
+        REST_BRANCH -->|"SelfNet only"| SELFNET["axial_restore_image()<br/>SelfNet (PyTorch subprocess)<br/>Axial resolution restoration"]
+        REST_BRANCH -->|"None"| RAW["Use raw input_dir"]
+
+        CARE --> SELFNET_POST["axial_restore_image()<br/>on CARE-restored data"]
+        SELFNET_POST --> NNUNET
+        CARE_ONLY --> NNUNET
+        SELFNET --> NNUNET
+        RAW --> NNUNET
+
+        NNUNET["nnunet_create_labels()<br/>Prepare → Predict → Cleanup"]
+
+        NNUNET --> PATCH_CHK{"Tiling<br/>enabled?"}
+        PATCH_CHK -->|Yes| PATCH["patch_images_for_nnunet()<br/>Overlapping 3D tiles"]
+        PATCH_CHK -->|No| PREDICT
+
+        PATCH --> PREDICT["run_nnunet_predict()<br/>External subprocess (respan99 env)<br/>nnUNetv2_predict"]
+
+        PREDICT --> REASSEMBLE_CHK{"Tiled?"}
+        REASSEMBLE_CHK -->|Yes| REASSEMBLE["reassemble_patch_predictions()<br/>Majority-vote stitching"]
+        REASSEMBLE_CHK -->|No| UNPAD
+
+        REASSEMBLE --> UNPAD["Unpad & rescale labels<br/>(if padded/rescaled)"]
+    end
+
+    style SEG fill:#d4edda,stroke:#28a745
+    style NNUNET fill:#28a745,color:#fff,stroke:#1e7e34
+    style PREDICT fill:#28a745,color:#fff,stroke:#1e7e34
+
+    %% ═══════════════════════════════════════════════
+    %% MAIN ANALYSIS PIPELINE
+    %% ═══════════════════════════════════════════════
+
+    UNPAD --> ANALYZE
+
+    subgraph CORE["Core Analysis Pipeline — analyze_spines()"]
+        direction TB
+        ANALYZE["analyze_spines()<br/><i>ImageAnalysis.py</i><br/>Loop over images"]
+
+        ANALYZE --> LOAD["Load raw image + labels<br/>imread / Dask"]
+
+        LOAD --> PROC["spine_and_whole_neuron_processing()<br/><i>Main orchestrator per image</i>"]
+
+        %% Label parsing
+        PROC --> MODEL_TYPE{"Model<br/>Type?"}
+        MODEL_TYPE -->|"Type 1"| MT1["1=Spines 2=Dendrites 3=Soma"]
+        MODEL_TYPE -->|"Type 2"| MT2["1=Dend 2=Soma 10=Spines"]
+        MODEL_TYPE -->|"Type 3"| MT3["1=Spines 2=Dend 3=Soma 4=Necks"]
+        MODEL_TYPE -->|"Type 4"| MT4["1=Dend 2=Cores 3=Membranes<br/>4=Necks 5=Soma 6=Axons"]
+
+        MT1 --> FILTER_DEND
+        MT2 --> FILTER_DEND
+        MT3 --> FILTER_DEND
+        MT4 --> FILTER_DEND
+
+        %% Dendrite filtering & distance maps
+        FILTER_DEND["filter_dendrites()<br/>Label → volume filter → binary"]
+        FILTER_DEND --> DISTANCES["Distance transforms<br/>soma_distance (EDT)<br/>dendrite_distance (EDT)"]
+        DISTANCES --> SKEL["Skeletonize dendrites<br/>morphology.skeletonize()"]
+
+        %% Spine detection
+        SKEL --> SPINE_DET{"Detection<br/>method?"}
+        SPINE_DET -->|"Type 1-3"| DET_BINARY["spine_detection()<br/>Erosion → EDT → Watershed<br/>or direct labeling"]
+        SPINE_DET -->|"Type 4"| DET_CORES["spine_detection_cores_and_membranes()<br/>Combine cores + membranes"]
+
+        DET_BINARY --> INIT_MEAS
+        DET_CORES --> INIT_MEAS
+
+        %% Initial measurements
+        INIT_MEAS["initial_spine_measurements()<br/>regionprops: centroid, volume, intensity<br/>Filter: size (min/max) + distance to dend"]
+
+        %% Neck processing (GPU)
+        INIT_MEAS --> NECK_CHK{"Necks<br/>available?"}
+        NECK_CHK -->|"Type 3/4"| NECK_ASSOC
+        NECK_CHK -->|"No necks"| GEODIST
+
+        NECK_ASSOC["associate_spines_with_necks_gpu()<br/>Pass 1: CC(targets) + nearest-ref<br/>anisotropic EDT + mode vote<br/>distance cap = spine_dist × 3 µm"]
+        NECK_ASSOC --> EXTEND["extend_objects_GPU()<br/>GPU pathfinding spine→dendrite<br/>land on target, exclude from ext"]
+        EXTEND --> NECK_ASSOC2["associate_spines_with_necks_gpu()<br/>Pass 2: remaining necks → corridor"]
+        NECK_ASSOC2 --> BRIDGE_MORPH["bridge_spine_neck_gaps()<br/>morph closing 1-iter<br/>fills 1-voxel gaps"]
+        BRIDGE_MORPH --> BRIDGE_PATH["bridge_spine_neck_via_pathfinding()<br/>signal-aware for still-split<br/>multi-voxel gaps with fluorescence"]
+        BRIDGE_PATH --> DROP_FRAG["drop_disconnected_neck_fragments()<br/>keep only spine-connected CC<br/>removes Pass-2 floating chunks"]
+        DROP_FRAG --> FLAG_SPUR["flag_spurious_necks()<br/>length + nnU-Net support + intensity<br/>AND-gate, mode=both default"]
+        FLAG_SPUR --> GEODIST
+
+        %% Geodesic distance
+        GEODIST["calculate_dend_ID_and_geo_distance()<br/>KDTree → dendrite assignment<br/>route_through_array → geodesic dist"]
+
+        %% Second pass refinement
+        GEODIST --> SECOND_PASS{"Refinement<br/>model?"}
+        SECOND_PASS -->|Yes| REFINE["second_pass_annotation()<br/>nnU-Net on isolated subvolumes"]
+        SECOND_PASS -->|No| MESH_CHK
+        REFINE --> MESH_CHK
+
+        %% Mesh analysis (GPU batched)
+        MESH_CHK{"Mesh<br/>analysis?"}
+        MESH_CHK -->|Yes| MESH_BATCH
+        MESH_CHK -->|No| VOX_MEAS
+
+        MESH_BATCH["analyze_spines_batch()<br/>GPU memory check → batch/tile<br/>extract_subvolumes (GPU)<br/>marching_cubes → mesh metrics<br/>batch_mesh_analysis:<br/>  volume, surface area,<br/>  length, width profile,<br/>  convex hull ratio"]
+
+        MESH_BATCH --> VOX_MEAS
+
+        %% Voxel measurements
+        VOX_MEAS["spine_vox_measurements()<br/>Per region: head, spine, neck<br/>Intensity stats per channel"]
+
+        %% Merge & export
+        VOX_MEAS --> MERGE["merge_spine_measurements()<br/>pd.merge on label column<br/>Consolidate all metrics"]
+
+        MERGE --> EXPORT["Export results<br/>spine_table → CSV<br/>Summary → CSV"]
+    end
+
+    style CORE fill:#fff3cd,stroke:#ffc107
+    style ANALYZE fill:#dc3545,color:#fff,stroke:#a71d2a
+    style PROC fill:#dc3545,color:#fff,stroke:#a71d2a
+
+    %% GPU highlights
+    style NECK_ASSOC fill:#ff8c00,color:#fff,stroke:#cc7000
+    style EXTEND fill:#ff8c00,color:#fff,stroke:#cc7000
+    style MESH_BATCH fill:#ff8c00,color:#fff,stroke:#cc7000
+    style GEODIST fill:#ff8c00,color:#fff,stroke:#cc7000
+
+    %% ═══════════════════════════════════════════════
+    %% VALIDATION
+    %% ═══════════════════════════════════════════════
+
+    EXPORT --> VAL_CHK{"Save validation<br/>data?"}
+
+    subgraph VAL["Validation & Output"]
+        direction TB
+        VAL_CHK -->|Yes| MIP["create_mip_and_save_multichannel_tiff()<br/>8-ch MIP: neuron, spines, filtered,<br/>necks, dendrites, skeleton,<br/>dend_distance, geodesic_distance"]
+        VAL_CHK -->|Yes| VOL["create_and_save_multichannel_tiff()<br/>Full 3D validation volumes"]
+        VAL_CHK -->|No| NEXT
+
+        MIP --> NEXT
+        VOL --> NEXT
+
+        NEXT{"More<br/>images?"}
+        NEXT -->|Yes| ANALYZE
+    end
+
+    style VAL fill:#e2e3e5,stroke:#6c757d
+
+    %% ═══════════════════════════════════════════════
+    %% 4D TRACKING
+    %% ═══════════════════════════════════════════════
+
+    NEXT -->|No| TRACK_CHK{"4D Tracking<br/>enabled?"}
+
+    subgraph TRACK["4D Spine Tracking — SpineTracking.py"]
+        direction TB
+        TRACK_CHK -->|Yes| REG["track_spines()<br/>serial_registration_with_elastix()<br/>Per timepoint pair:<br/>  create_mask → elastix (rigid+deformable)<br/>  → apply_transform to all channels"]
+        TRACK_CHK -->|No| DONE
+
+        REG --> SAVE_4D["save_as_4d_tiff_elastix()<br/>Registered_images_4D.tif"]
+        SAVE_4D --> ANALYZE_4D["analyze_spines_4D()<br/>Per timepoint:<br/>  filter_dendrites → spine_detection<br/>  → measurements → geodesic dist<br/>  → spine linking across T"]
+        ANALYZE_4D --> DONE
+    end
+
+    style TRACK fill:#e8d5f5,stroke:#7b2d8e
+    style REG fill:#7b2d8e,color:#fff,stroke:#5a1f6a
+    style ANALYZE_4D fill:#7b2d8e,color:#fff,stroke:#5a1f6a
+
+    DONE["Pipeline Complete<br/>Tables/ — CSV results<br/>Validation_Data/ — MIPs, volumes, labels<br/>Spine_Arrays/ — per-spine subvolumes<br/>Spine_Meshes/ — mesh files (optional)"]
+
+    style DONE fill:#d4edda,color:#155724,stroke:#28a745
+
+    %% ═══════════════════════════════════════════════
+    %% LEGEND
+    %% ═══════════════════════════════════════════════
+
+    subgraph LEGEND["Color Key"]
+        direction LR
+        L1["Entry / Init"]
+        L2["Segmentation"]
+        L3["GPU-Accelerated"]
+        L4["Core Pipeline"]
+        L5["4D Tracking"]
+    end
+
+    style L1 fill:#4a90d9,color:#fff,stroke:#2c5f8a
+    style L2 fill:#28a745,color:#fff,stroke:#1e7e34
+    style L3 fill:#ff8c00,color:#fff,stroke:#cc7000
+    style L4 fill:#dc3545,color:#fff,stroke:#a71d2a
+    style L5 fill:#7b2d8e,color:#fff,stroke:#5a1f6a
+    style LEGEND fill:#f8f9fa,stroke:#dee2e6

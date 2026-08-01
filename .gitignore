@@ -15,3 +15,16 @@
 /RESPAN/.pytest_cache
 /RESPAN/__pycache__
 /RESPAN/.idea
+
+# Python bytecode (recursive, catches all __pycache__/ subdirs)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test runner output (T2/T4/T6/T7 leftovers when tests run from this dir)
+_profiling/
+benchmarks/
+
+# IDE
+.idea/
+.vscode/

@@ -16,6 +16,8 @@ __download__  = 'http://www.github.com/lahmmond/RESPAN'
 import numpy as np
 import pandas as pd
 
+pd.set_option('future.no_silent_downcasting', True)
+
 
 # helper
 
@@ -40,8 +42,8 @@ def merge_spine_measurements(df1, df2, settings, logger):
         df2['label'] = df2['label'].astype(str)
 
         # Convert any numpy arrays to lists
-        df1 = df1.applymap(lambda x: x.tolist() if isinstance(x, np.ndarray) else x)
-        df2 = df2.applymap(lambda x: x.tolist() if isinstance(x, np.ndarray) else x)
+        df1 = df1.map(lambda x: x.tolist() if isinstance(x, np.ndarray) else x)
+        df2 = df2.map(lambda x: x.tolist() if isinstance(x, np.ndarray) else x)
 
         # Merge the DataFrames on the 'label' column
         merged_df = pd.merge(df1, df2, on='label', how='outer', suffixes=('_1', '_2'))
@@ -63,8 +65,25 @@ def merge_spine_measurements(df1, df2, settings, logger):
             elif col.endswith('_2') and col[:-2] not in merged_df.columns:
                 merged_df = merged_df.rename(columns={col: col[:-2]})
 
-        # Fill NaN values with 0
-        merged_df = merged_df.fillna(0)
+        # Preserve NaN for columns where NaN has semantic meaning (e.g.,
+        # "skipped" in calculate_dend_ID_and_geo_distance for over-large
+        # dendrites whose float64 distance_map exceeds the 50 GB hard limit).
+        # Without this, fillna(0) below converts those NaNs to 0, which is
+        # ambiguous with "at the soma" — users can't tell skipped vs valid.
+        _nan_preserve_cols = ('geodesic_dist_to_soma',)
+        _preserved_nan_mask = {
+            c: merged_df[c].isna() for c in _nan_preserve_cols if c in merged_df.columns
+        }
+
+        # Fill NaN values with 0 (default for measurement columns that use 0
+        # to mean "not applicable" — e.g. neck_length=0 for partial-spines).
+        merged_df = merged_df.fillna(0).infer_objects(copy=False)
+
+        # Restore NaN for the semantic-skip columns.
+        for _c, _mask in _preserved_nan_mask.items():
+            if _mask.any():
+                merged_df[_c] = merged_df[_c].astype('float64')
+                merged_df.loc[_mask, _c] = float('nan')
 
         # Convert 'label' back to int if possible
         try:
@@ -89,6 +108,14 @@ def merge_spine_measurements(df1, df2, settings, logger):
 def create_spine_summary_neuron(filtered_table, filename, dendrite_length, dendrite_volume, settings):
     #create summary table
 
+    # Count filopodia BEFORE dropping spine_type (columns used for .mean()).
+    # If spine_type column is missing (older runs), n_filopodia = 0.
+    if 'spine_type' in filtered_table.columns:
+        n_filopodia = int((filtered_table['spine_type'] == 'filopodia').sum())
+    else:
+        n_filopodia = 0
+    n_total = int(filtered_table.shape[0])
+
     #spine_reduced = filtered_table.drop(columns=['label', 'z', 'y', 'x'])
     updated_table = filtered_table.iloc[:, 4:]
     #drop dendrite_id column
@@ -110,9 +137,12 @@ def create_spine_summary_neuron(filtered_table, filename, dendrite_length, dendr
     spine_summary.insert(3, 'dendrite_length', dendrite_length * settings.input_resXY)
     #spine_summary.insert(5, 'dendrite_vol', dendrite_volume)
     spine_summary.insert(4, 'dendrite_vol', dendrite_volume * settings.input_resXY*settings.input_resXY*settings.input_resZ)
-    spine_summary.insert(5, 'total_spines', filtered_table.shape[0])
-    spine_summary.insert(6, 'spines_per_um', spine_summary['total_spines']/spine_summary['dendrite_length'])
-    spine_summary.insert(7, 'spines_per_um3', spine_summary['total_spines']/spine_summary['dendrite_vol'])
+    spine_summary.insert(5, 'total_spines', n_total)
+    spine_summary.insert(6, 'n_filopodia', n_filopodia)
+    spine_summary.insert(7, 'n_spines_excl_filopodia', n_total - n_filopodia)
+    spine_summary.insert(8, 'spines_per_um', np.where(spine_summary['dendrite_length'] > 0, n_total / spine_summary['dendrite_length'], 0))
+    spine_summary.insert(9, 'filopodia_per_um', np.where(spine_summary['dendrite_length'] > 0, n_filopodia / spine_summary['dendrite_length'], 0))
+    spine_summary.insert(10, 'spines_per_um3', np.where(spine_summary['dendrite_vol'] > 0, n_total / spine_summary['dendrite_vol'], 0))
 
     return spine_summary
 
@@ -155,6 +185,15 @@ def safe_drop_columns(df, columns_to_drop, axis=1):
 def create_spine_summary_dendrite(filtered_table, filename, dendrite_lengths, dendrite_volumes, settings, locations):
     #create summary table
 
+    # Compute filopodia counts per dendrite BEFORE dropping spine_type (used for .mean()).
+    if 'spine_type' in filtered_table.columns and 'dendrite_id' in filtered_table.columns:
+        filopodia_counts_by_dend = (
+            filtered_table[filtered_table['spine_type'] == 'filopodia']
+            .groupby('dendrite_id').size()
+        )
+    else:
+        filopodia_counts_by_dend = pd.Series(dtype=int)
+
     #filtered_table = filtered_table.drop(['spine_id', 'x', 'y', 'z','spine_type'], axis=1)
     filtered_table = safe_drop_columns(filtered_table, ['spine_id', 'x', 'y', 'z', 'spine_type'])
 
@@ -180,13 +219,27 @@ def create_spine_summary_dendrite(filtered_table, filename, dendrite_lengths, de
     spine_summary['dendrite_volume'] = spine_summary['dendrite_volume'] *settings.input_resXY*settings.input_resXY*settings.input_resZ
     #spine_summary = move_column(spine_summary, 'dendrite_length_um', 5)
     #spine_summary = move_column(spine_summary, 'dendrite_vol_um3', 7)
-    spine_summary.insert(9, 'spines_per_um', spine_summary['total_spines']/spine_summary['dendrite_length'])
-    spine_summary.insert(10, 'spines_per_um3', spine_summary['total_spines']/spine_summary['dendrite_volume'])
 
-    desired_order = ['Filename', 'res_XY', 'res_Z', 'dendrite_id', 'dendrite_length', 'dendrite_volume', 'total_spines', 'spines_per_um', 'spines_per_um3'] + \
+    # Filopodia counts and rate per dendrite.
+    spine_summary['n_filopodia'] = (
+        spine_summary['dendrite_id'].map(filopodia_counts_by_dend).fillna(0).astype(int))
+    spine_summary['n_spines_excl_filopodia'] = (
+        spine_summary['total_spines'] - spine_summary['n_filopodia'])
+    spine_summary['filopodia_per_um'] = np.where(
+        spine_summary['dendrite_length'] > 0,
+        spine_summary['n_filopodia'] / spine_summary['dendrite_length'], 0)
+
+    spine_summary.insert(9, 'spines_per_um', np.where(spine_summary['dendrite_length'] > 0, spine_summary['total_spines'] / spine_summary['dendrite_length'], 0))
+    spine_summary.insert(10, 'spines_per_um3', np.where(spine_summary['dendrite_volume'] > 0, spine_summary['total_spines'] / spine_summary['dendrite_volume'], 0))
+
+    desired_order = ['Filename', 'res_XY', 'res_Z', 'dendrite_id', 'dendrite_length', 'dendrite_volume',
+                     'total_spines', 'n_filopodia', 'n_spines_excl_filopodia',
+                     'spines_per_um', 'filopodia_per_um', 'spines_per_um3'] + \
                     [col for col in spine_summary.columns if col not in ['Filename', 'res_XY', 'res_Z', 'dendrite_id',
                                                                          'dendrite_length', 'dendrite_volume',
-                                                                         'total_spines', 'spines_per_um',
+                                                                         'total_spines', 'n_filopodia',
+                                                                         'n_spines_excl_filopodia',
+                                                                         'spines_per_um', 'filopodia_per_um',
                                                                          'spines_per_um3']] + \
                     []
     spine_summary = spine_summary[desired_order]

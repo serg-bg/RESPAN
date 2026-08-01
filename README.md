@@ -2,12 +2,23 @@
 <p align="center">
   <img src="images/Panel 1.jpg" alt="RESPAN" width="600">
 </p>
-RESPAN is an end‑to‑end, GPU‑accelerated pipeline that restores, segments, and quantifies dendrites and dendritic spines in fluorescent microscopy images in a robust, accurate, and unbiased manner. While developing this pipeline, emphasis was placed on ensuring an efficient and accessible pipeline that leverages the latest advancements in content‑aware restoration, image segmentation, and GPU processing. 
-</p>
-For ease of use, RESPAN is available as both (i) a ready‑to‑run Windows application and (ii) Python scripts. 
-</p> Please note that this software requires a computer with an NVIDIA GPU. </p>
-Developed in collaboration with the Polleux Lab (Zuckerman Institute, Columbia University).
-</p>
+
+RESPAN is an end‑to‑end, GPU‑accelerated pipeline that restores, segments, and quantifies dendrites and dendritic spines in fluorescent microscopy images in a robust, accurate, and unbiased manner. While developing this pipeline, emphasis was placed on ensuring an efficient and accessible pipeline that leverages the latest advancements in content‑aware restoration, image segmentation, and GPU processing. For ease of use, RESPAN is available as both (i) a ready‑to‑run Windows application and (ii) Python scripts. Please note that this software requires a computer with an NVIDIA GPU.
+
+RESPAN was developed and is maintained by Luke Hammond, Director of Quantitative Imaging, The Ohio State University. RESPAN originated from an ongoing scientific collaboration with Sergio Bernal-Garcia and the Polleux Lab at Columbia University. Subsequent development by Luke Hammond, in scientific collaboration with Daniela Pereira and the Alves da Silva Lab at the Champalimaud Foundation, has focused on extending RESPAN's scalability to 50 GB+ whole-neuron neuron datasets on workstations with moderate resources, such as systems with 128 GB RAM and a 24 GB GPU.
+
+Current development priorities include further optimization of computational efficiency and scalability, as well as improved analysis of complex dendritic spine morphologies, including filopodia and multi-headed spines. Some early versions of these capabilities are included in RESPAN 1.5.
+
+We encourage the community to build on the models provided in this repository, through fine-tuning existing models or training new ones. We are happy to share links to compatible community-developed models on this repository.
+
+> **A note on generalization and fine-tuning.** Deep learning segmentation has the potential to be more robust and sensitive than conventional approaches, but our models may not always generalize well to every dataset. When features are missed or represented inaccurately, we strongly encourage fine-tuning our models rather than annotating from scratch — you can start from RESPAN's outputs, correct them, and retrain from our pretrained weights. Fine-tuning requires only our pretrained model and your corrected data. See the **[RESPAN Fine-Tuning Guide](docs/Fine_Tuning_Guide.md)** for a step-by-step walkthrough.
+
+> **What's new in v1.5.** Validated end-to-end on 55 GB images with moderate resources (128GB RAM, 24GB GPU), new spine classes (filopodia, multi-head), in-GUI threshold controls for handling spine inclusion/exclusion based on neck quality, and fixes for several user-reported issues (CARE training, GPU memory check, large-dendrite OOM). See **[UPDATES.md](UPDATES.md)** for the full release notes.
+
+**If you use RESPAN as part of your research, please cite our work using the reference below:**
+
+Sergio Bernal-Garcia, Alexa P. Schlotter, Daniela Pereira, Franck Polleux, Luke A. Hammond. (2025). A deep learning pipeline for accurate and automated restoration, segmentation, and quantification of dendritic spines. Cell Reports Methods 5(10):101179. doi:10.1016/j.crmeth.2025.101179
+
 <p align="center">
   <img src="images/Panel 2.jpg" alt="RESPAN" width="600">
 </p>
@@ -61,10 +72,10 @@ If you need help getting started, please refer to our video tutorial. Chapters l
    • RESPAN Analysis Settings file &nbsp;→&nbsp; [here](https://drive.google.com/file/d/1sZoBfViD62nNu-9FYWtYMHtLq6Hwjwhk/view?usp=drive_link) <br>
    • Pre‑trained models &nbsp;→&nbsp; see Segmentation Models table below<br>
    • For testing, we also provide example spinning disk confocal [datasets](https://drive.google.com/drive/folders/1EDVKGOotXsRbQdcGckADQu4zYjeQD9wH?usp=drive_link) with example [results](https://drive.google.com/drive/folders/1ExA2w5PdQw3_5Cfp6PPmwGp3_qwLbLgh?usp=drive_link) 
-3. **Install**  
+2. **Install**  
    ▸ Unzip RESPAN.zip with [7zip](https://www.7-zip.org/)<br>
    ▸ Double‑click RESPAN.exe (first run may require 1-2 min to initialize)<br>
-4. **Prepare your data**  
+3. **Prepare your data**  
    ```text
    MyExperiment/
    ├── Animal_A/
@@ -77,11 +88,11 @@ If you need help getting started, please refer to our video tutorial. Chapters l
        └── Analysis_Settings.yml
    ```
    *Copy **Analysis_Settings.yml** into every sub‑folder (stores resolution, advanced settings, and allows batch processing. Default settings suit most experiments, with editing only required when using advanced functionality and image restoration).
-5. **Run**  
+4. **Run**  
    • Select the *parent* folder (e.g. "MyExperiment") in the GUI  
    • Update analysis settings
    • Click **Run** – a 100 MB stack processes in ≈3 min on an RTX 4090
-6. **Inspect outputs**  
+5. **Inspect outputs**  
    | Folder | Contents |
    |---|---|
    | `Tables/` | Per‑image CSVs (`Detected_spines_*.csv`) + experiment summary |
@@ -104,7 +115,8 @@ If you need help getting started, please refer to our video tutorial. Chapters l
 
 | Task | GUI Tab | Typical time | Tutorial link |
 |------|---------|--------------|----------------|
-| Segmentation (nnU‑Net) | **nnU‑Net Training** | 12–24 h | [tutorial](https://www.youtube.com/watch?v=Q6zu6y5P6Mc&t=3768s) |
+| Segmentation (nnU‑Net) – train from scratch | **nnU‑Net Training** | 12–24 h | [video tutorial](https://www.youtube.com/watch?v=Q6zu6y5P6Mc&t=3768s) |
+| Segmentation (nnU‑Net) – **fine-tune from our weights** *(recommended)* | command line | 2–6 h | [Fine-Tuning Guide](docs/Fine_Tuning_Guide.md) |
 | Image restoration (CARE‑3D) | **CARE Training** | 3–5 h | [tutorial](https://www.youtube.com/watch?v=Q6zu6y5P6Mc&t=3515s) |
 | Axial resolution (SelfNet) | **SelfNet Training** | ≤2 h | [tutorial](https://www.youtube.com/watch?v=Q6zu6y5P6Mc&t=3390s) |
 
@@ -113,15 +125,16 @@ Detailed protocols – including data organisation and annotation tips – are i
 ---
 
 ## 🎯 Pre‑trained segmentation models
+Please complete a brief Google Form to access the RESPAN pretrained weights. The link appears on the next page following form submission. No account required. Takes ~30 seconds and lets us understand how and where our software is used.
   
-| Segmentation Model | Download | Modality | Resolution | Annotations | Details |
-| ------------- | ------------- | ------------- | ------------- | ------------- | ------------- |
-| Model 1A | [download](https://drive.google.com/drive/folders/1j9XQi4x1-IsRvln_-dzR-vF94cuV35RZ?usp=drive_link) | Spinning disk and Airyscan/laser scanning confocal microscopy | 65 x 65 x 150nm | spines, dendrites, and soma | 224 datasets, including restored and raw data and additional augmentation |
-| Model 1B | [download](https://drive.google.com/drive/folders/1LTEO4aApPfTeTDEECMC-QJCpwWkL_C6w?usp=drive_link) | Spinning disk and Airyscan/laser scanning confocal microscopy | 65 x 65 x 150nm | spines core & shell, dendrites, axons, and soma | 44 datasets, including restored and raw data and additional augmentation |
-| Model 2 | [download](https://drive.google.com/drive/folders/1MTSU7acFDZOUs9q1t_0gwU9DIbckYugi?usp=drive_link) | Spinning disk confocal microscopy  | 65 x 65 x 65nm | spines, necks, dendrites, and soma | isotropic model, 7 datasets, no augmentation |
-| Model 3 |  [download](https://drive.google.com/drive/folders/1-KQc-Tzpk1dn3fgAln-KJrIIwM6amVFG?usp=drive_link) |Two-photon in vivo confocal microscopy  | 102 x 102 x 1000nm | spines and dendrites | 908 datasets, additional augmentation |
+| Segmentation Model | Download | Year | Modality | Resolution | Annotations | Details |
+| ------------- | ------------- | -------------| ------------- | ------------- | ------------- | ------------- |
+| Model 1A | [download](https://forms.gle/pUguQwn1V5vkSCKs9) | 2025 | Spinning disk and Airyscan/laser scanning confocal microscopy | 65 x 65 x 150nm | spines, dendrites, and soma | 224 datasets, including restored and raw data and additional augmentation |
+| Model 1Bv2 *recommended | [download](https://forms.gle/pUguQwn1V5vkSCKs9) | 2026 | Spinning disk and Airyscan/laser scanning confocal microscopy | 65 x 65 x 150nm | spines core & shell, dendrites, axons, and soma | 224 datasets, including restored and raw data and additional augmentation updated thanks to Sergio Bernal-Garcia and Columbia University colleagues |
+| Model 2 | [download](https://forms.gle/pUguQwn1V5vkSCKs9) | 2025 | Spinning disk confocal microscopy  | 65 x 65 x 65nm | spines, necks, dendrites, and soma | isotropic model, 7 datasets, no augmentation |
+| Model 3 |  [download](https://forms.gle/pUguQwn1V5vkSCKs9) | 2025 | Two-photon in vivo confocal microscopy  | 102 x 102 x 1000nm | spines and dendrites | 908 datasets, additional augmentation |
 
-For detailed protocols using RESPAN, please refer to [our manuscript.](https://www.biorxiv.org/content/10.1101/2024.06.06.597812v2)
+For detailed protocols using RESPAN, please refer to [our manuscript.](https://doi.org/10.1016/j.crmeth.2025.101179)
 
 ---
 
@@ -140,9 +153,9 @@ CRITICAL: Ground truth annotations and the corresponding raw data volumes intend
 
 ## 📚 Publications
 
-If RESPAN assisted your research, please cite our work using the reference below:
-If you use RESPAN as part of your research, please cite our work using the reference below:</p>
-Sergio B. Garcia, Alexa P. Schlotter, Daniela Pereira, Franck Polleux, Luke A. Hammond. (2024) RESPAN: An Automated Pipeline for Accurate Dendritic Spine Mapping with Integrated Image Restoration. bioRxiv. doi: https://doi.org/10.1101/2024.06.06.597812</p></p>
+If you use RESPAN as part of your research, please cite our work using the reference below:
+
+Sergio Bernal-Garcia, Alexa P. Schlotter, Daniela Pereira, Franck Polleux, Luke A. Hammond. (2025). A deep learning pipeline for accurate and automated restoration, segmentation, and quantification of dendritic spines. Cell Reports Methods 5(10):101179. doi:10.1016/j.crmeth.2025.101179
 
 RESPAN is already supporting peer-reviewed studies:
 * Baptiste Libé-Philippot, Ryohei Iwata, Aleksandra J. Recupero, Keimpe Wierda, Sergio Bernal Garcia, Luke Hammond, Anja van Benthem, Ridha Limame, Martyna Ditkowska, Sofie Beckers, Vaiva Gaspariunaite, Eugénie Peze-Heidsieck, Daan Remans, Cécile Charrier, Tom Theys, Franck Polleux, Pierre Vanderhaeghen (2024)
@@ -150,6 +163,61 @@ Synaptic neoteny of human cortical neurons requires species-specific balancing o
 
 ---
 ## 🛠️ Advanced usage: creating environments for use in Python
+RESPAN uses a **dual-environment architecture**:
+- **Main environment** (`respan_gpu`): Runs the analysis pipeline (CuPy, scikit-image, trimesh, etc.)
+- **nnU-Net environment** (`respan_nnunet`): Runs nnU-Net inference as a subprocess (PyTorch, nnU-Net v2)
+
+This separation is required because CARE/csbdeep needs TensorFlow <2.11 (Python 3.9), while nnU-Net v2 benefits from newer PyTorch + CUDA.
+
+### Main environment (Python 3.9, CUDA 11.8)
+```bash
+mamba create -n respan_gpu python=3.9 -y
+conda activate respan_gpu
+
+# Core scientific stack
+mamba install scikit-image pandas "numpy>=1.23,<2" nibabel ipython pyyaml pynvml \
+    numba zarr memory_profiler trimesh psutil -c conda-forge -y
+
+# GPU + deep learning (CUDA 11.8)
+pip install "cupy-cuda11x>=13.2" "scipy>=1.13"
+pip install "tensorflow<2.11" csbdeep  # CARE restoration (caps Python at 3.9)
+
+# GUI (optional, for RESPAN_GUI_DIST.py)
+pip install pyqt5
+
+# Additional
+pip install "patchify>=0.2.3" tifffile
+```
+
+### nnU-Net environment (Python 3.9+, PyTorch + CUDA 12.1)
+```bash
+mamba create -n respan_nnunet python=3.9 pytorch torchvision pytorch-cuda=12.1 \
+    scikit-image opencv -c pytorch -c nvidia -y
+conda activate respan_nnunet
+
+# Install nnU-Net v2
+git clone -b v2.3.1 https://github.com/MIC-DKFZ/nnUNet.git
+cd nnUNet && pip install -e .
+```
+
+### Configuration
+The main environment needs to know where the nnU-Net Python is located. Set `internal_py_path` in `Analysis_Settings.yaml`:
+```yaml
+internal_py_path: "path/to/respan_nnunet/python"
+```
+
+### System requirements for Python usage
+| Resource | Minimum | Recommended |
+|----------|---------|-------------|
+| GPU VRAM | 12 GB | 24+ GB |
+| System RAM | 32 GB | 128+ GB |
+| Python | 3.9 | 3.9 (TF constraint) |
+| CUDA | 11.8+ | 12.1 for nnU-Net |
+
+> RESPAN's chunked processing pipeline has been validated on images up to 55 GB (30 billion voxels) on a 128 GB RAM / 24 GB VRAM host, streaming through zarr-backed intermediate arrays. Smaller-memory hosts are supported by adaptive chunk sizing but have not been benchmarked.
+
+<details><summary>Legacy environment instructions (deprecated)</summary>
+
 Main development environment:
 1. mamba create -n respandev python=3.9 scikit-image pandas "numpy=1.23.4" nibabel pyinstaller ipython pyyaml pynvml numba dask dask-image ome-zarr zarr memory_profiler trimesh -c conda-forge -c nvidia -y
 2. conda activate respandev3
@@ -159,12 +227,15 @@ Secondary environment:
 1. mamba create -n respaninternal python=3.9  pytorch torchvision pytorch-cuda=12.1 scikit-image opencv -c pytorch -c nvidia -y
 2. git clone -b v2.3.1 https://github.com/MIC-DKFZ/nnUNet.git
 3. cd to that repo dir then pip install -e ./nnUNet
-   
+
+</details>
+
 ---
 ## 🛠️ Future Developments
 - Our latest model uses 3D spine cores and membranes to further improve accuracy in dense environments
-- Integration of Dask to remove resource limitations on processing large datasets
-- Improved efficiency in batch GPU mesh measurements, neck generation, and geodesic distance measurements
+- Batched GPU mesh measurements for large spine populations (100K+ spines)
+- Native OME-Zarr / NGFF reading and writing across the pipeline (the chunked path already uses zarr-backed intermediates)
+- Continued model fine-tuning support for additional modalities
 
 ---
 ## Benchmark: Processing and Training Times by System Configuration

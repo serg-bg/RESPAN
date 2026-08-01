@@ -31,11 +31,17 @@ def _gpu_mem() -> Dict[str, float]:
 
 
 def _scan_locals(frame: FrameType, top: int = 10) -> Dict[str, str]:
-    """Return the *top* largest numpy / cupy arrays in the given frame."""
+    """Return the *top* largest numpy / cupy arrays in the given frame.
+
+    Filters to entries whose ``.nbytes`` is an int — class objects and other
+    descriptors expose ``nbytes`` as a getset_descriptor (unbound), which would
+    crash the sort by mixing int and descriptor in the tuple comparator.
+    """
     sizes = []
     for name, val in frame.f_locals.items():
-        if hasattr(val, "nbytes"):
-            sizes.append((val.nbytes, name, val.shape if hasattr(val, "shape") else None))
+        nb = getattr(val, "nbytes", None)
+        if isinstance(nb, int):
+            sizes.append((nb, name, val.shape if hasattr(val, "shape") else None))
     sizes.sort(reverse=True)
     out = {n: f"{round(sz / GB, 3)} GB {sh}" for sz, n, sh in sizes[:top]}
     return out
@@ -96,8 +102,8 @@ def profile_mem(logger=None, *, top_vars: int = 10):
             gpu_post = _gpu_mem()
 
             _emit(
-                f"     [{func.__name__}] ΔRAM {round((ram_post-ram_pre)/GB,3)} GB "
-                f"     ΔGPU {round(gpu_post['gpu_used_GB']-gpu_pre['gpu_used_GB'],3)} GB "
+                f"     [{func.__name__}] dRAM {round((ram_post-ram_pre)/GB,3)} GB "
+                f"     dGPU {round(gpu_post['gpu_used_GB']-gpu_pre['gpu_used_GB'],3)} GB "
                 f"\n     RAM {round(ram_post/GB,3)} GB "
                 f"     GPU {gpu_post['gpu_used_GB']} GB "
                 f"     {dt:.2f}s", log)
